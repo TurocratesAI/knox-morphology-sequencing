@@ -33,9 +33,10 @@ RUN python -m pip install \
 
 COPY --chown=user:user app.py /opt/app/
 COPY --chown=user:user inference.py /opt/app/
+COPY --chown=user:user report_ref.json /opt/app/
 # weights are NOT baked in: Midnight + MIL weights ship as the separate model tarball (/opt/ml/model)
 
-# This label is required - Grand Challenge uses it to detect that the container
+# This label is required — Grand Challenge uses it to detect that the container
 # implements the invoke API. Without it, the examples provided in this starter kit will not work.
 LABEL org.grand-challenge.api-method="invoke"
 
