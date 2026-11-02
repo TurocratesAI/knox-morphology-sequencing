@@ -1,0 +1,46 @@
+# Model weights and bundles
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.safetensors
+*.bin
+*.onnx
+*.tar
+*.tar.gz
+*.tgz
+model/
+container/model/
+
+# Data, slides and outputs
+data/
+logs/
+output/
+outputs/
+container/test/
+*.tif
+*.tiff
+*.svs
+*.mha
+*.log
+
+# Caches and environments
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.cache/
+.venv/
+venv/
+
+# Secrets and credentials
+.env
+.env.*
+.hf_token
+*.token
+*_token
+token.txt
+.netrc
+credentials*
+*.pem
+*.key

@@ -1,0 +1,10 @@
+KNOX
+Copyright 2026 Turocrates.ai
+
+This product includes software developed at Turocrates.ai.
+
+container/app.py and the container/do_*.sh helper scripts are adapted from the
+Grand Challenge example algorithm template.
+
+Pretrained encoder weights (Midnight-12K, UNI2-h, Phikon-v2, H-optimus-0) are
+not distributed with this software and remain under their own licences.

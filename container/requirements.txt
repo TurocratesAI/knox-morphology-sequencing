@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+numpy
+scipy
+pillow
+transformers
+safetensors
+openslide-python
+openslide-bin
+tifffile
+imagecodecs
+matplotlib
+timm==1.0.26
