@@ -1,0 +1,7 @@
+# Build context for the root Dockerfile: only the container code is needed.
+*
+!container/
+!container/requirements.txt
+!container/app.py
+!container/inference.py
+!container/report_ref.json

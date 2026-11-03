@@ -134,3 +134,7 @@ Paper under review (WACV 2027 CVPath workshop).
 ## Licence
 
 Apache License 2.0. See `LICENSE` and `NOTICE`.
+
+## Building on Grand Challenge
+
+The root `Dockerfile` builds the same image as `container/Dockerfile` and is what the Grand Challenge GitHub integration uses: link this repository to the algorithm, and every new tag (or GitHub release) triggers a build. Model weights are not in the repository; upload them separately on the algorithm's Models page as a tarball of the model directory (`container/do_save.sh` creates it). At run time they are available at `/opt/ml/model`.
