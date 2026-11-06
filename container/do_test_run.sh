@@ -216,9 +216,9 @@ start_container() {
         --volume "$STAGING_OUTPUT_DIR":/output
         --volume "$DOCKER_VOLUME_TAG":/tmp
         --network "$DOCKER_NETWORK_TAG"
-        # T4 instance emulation: 32 GB RAM, 8 vCPU, one GPU capped at 16 GB inside the app
+        # T4 instance emulation: 32 GB RAM, 8 vCPU, one GPU capped at 14 GB inside the app (a T4 exposes about 14.6 GiB)
         --memory=32g --memory-swap=32g --cpus=8 --shm-size=2g
-        --env OWL_GPU_MEM_GB=16 --env OWL_SELECT="${OWL_SELECT:-lattice}" --env OWL_DEBUG_DUMP="${OWL_DEBUG_DUMP:-}"
+        --env OWL_GPU_MEM_GB="${OWL_GPU_MEM_GB:-14}" --env OWL_SELECT="${OWL_SELECT:-lattice}" --env OWL_DEBUG_DUMP="${OWL_DEBUG_DUMP:-}"
     )
 
     docker run "${docker_run_args[@]}" "$DOCKER_IMAGE_TAG" >/dev/null

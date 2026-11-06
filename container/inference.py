@@ -16,7 +16,13 @@ Pipeline per case (mirrors pipeline/owl_extract.py + experiments/e0/e1 used in t
   -> tile deletion effect D_i = mean_m a_i (v_i - z_m) / (1 - a_i), v_i = (w . h_i + b - mu_m) / sd_m: the exact
      change in the score when tile i is removed (softmax renormalised), as OWL's perturbation test measures.
 Outputs: overall-survival-years.json (monotone in -z), prostate-cancer-risk-classification.json,
-the attribution TIFF on the mask grid (uint8, 128 = neutral, >128 pushes towards recurrence) and a 2-page PDF.
+the attribution TIFF on the mask grid and a 5-page PDF. The attribution map is drawn on the patch grid of the
+organisers' faithfulness test (256 px at 0.5 um/px from the mask origin): every patch that overlaps a field removed
+by sequential knockout carries that field's rank (earliest 255 ... 130); tissue the model did not read takes 3 ... 129
+from the order spread from its nearest read field (heat_rank), so it always ranks below every read field; patches that
+touch only fields whose removal would raise the score 1; outside the mask 0 (heat_patches). The report shows the
+spread order itself, which is easier to read at slide scale.
+Faithfulness notebook: get_args_parser() and run(args) load the model on each call (see run()).
 Env (local sandbox only): OWL_GPU_MEM_GB caps GPU memory to emulate a T4.
 """
 import glob, json, os, queue, threading, time
@@ -30,6 +36,9 @@ from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = None
 INPUT_PATH, OUTPUT_PATH = Path("/input"), Path("/output")
+DIRS = {}                                                   # folder overrides for run(args) (faithfulness notebook)
+REPORT = True                                               # False: no PDF (prediction and map unchanged)
+ENSEMBLE = "15 fold models, 5 per image model"            # how the score is combined (printed in the report)
 MODEL_DIR = Path(os.environ.get("OWL_MODEL_DIR", "/opt/ml/model"))
 TILE_PX, MPP20, MAX_TILES, GRID_THR, NMAX = 224, 0.5, 16000, 0.25, 4000
 SELECT = os.environ.get("OWL_SELECT", "lattice")         # "list" = training rule; lattice is mask-stable (e31)
@@ -88,6 +97,9 @@ def init_model():
 
 
 # ------------------------------------------------------------------ slide geometry (as owl_extract.py)
+MPP_OK = (0.08, 2.0)                                       # plausible slide pixel sizes (um); outside: tag is wrong
+
+
 def tiff_mpp(path):
     import tifffile
     with tifffile.TiffFile(path) as t:
@@ -98,20 +110,33 @@ def tiff_mpp(path):
         return per / ppu
 
 
-def slide_mpp(sl, path):
+def slide_mpp(sl, path, mask_spacing=None, mscale=None):
+    """Slide pixel size in um: the TIFF resolution tag, then openslide's mpp, then the mask's own spacing divided by
+    the slide-to-mask scale, then 0.25; each only if it lies in MPP_OK."""
+    cands = []
     try:
-        return tiff_mpp(path)
+        cands.append(("tiff tag", tiff_mpp(path)))
     except Exception:
-        v = sl.properties.get("openslide.mpp-x")
-        if v:
+        pass
+    try:
+        cands.append(("openslide mpp", float(sl.properties.get("openslide.mpp-x"))))
+    except Exception:
+        pass
+    if mask_spacing and mscale:
+        cands.append(("mask spacing", mask_spacing / mscale))
+    for src, v in cands:
+        if MPP_OK[0] <= v <= MPP_OK[1]:
+            if src != "tiff tag":
+                log(f"WARNING: slide pixel size from {src}: {v:.4f} um")
             return float(v)
-        log("WARNING: no resolution tag; assuming 0.2425 um/px"); return 0.2425
+    log(f"WARNING: no plausible pixel size ({cands}); assuming 0.25 um/px"); return 0.25
 
 
 def grid(W, H, size0, mask, mscale, thr=GRID_THR):
     xs = np.arange(0, W - size0 + 1, size0); ys = np.arange(0, H - size0 + 1, size0)
     gx, gy = np.meshgrid(xs, ys); c = np.stack([gx.ravel(), gy.ravel()], 1).astype(np.int64)
-    S = np.zeros((mask.shape[0] + 1, mask.shape[1] + 1)); S[1:, 1:] = mask.astype(np.float64).cumsum(0).cumsum(1)
+    dt = np.int32 if mask.size < 2**31 else np.int64         # integral image of the mask (exact, a quarter of float64 memory)
+    S = np.zeros((mask.shape[0] + 1, mask.shape[1] + 1), dt); S[1:, 1:] = mask.cumsum(0, dtype=dt).cumsum(1, dtype=dt)
     h, w = mask.shape
     x0 = np.clip((c[:, 0] / mscale).astype(int), 0, w); y0 = np.clip((c[:, 1] / mscale).astype(int), 0, h)
     x1 = np.clip(((c[:, 0] + size0) / mscale).astype(int), 0, w); y1 = np.clip(((c[:, 1] + size0) / mscale).astype(int), 0, h)
@@ -129,11 +154,50 @@ def cap(c, W, H, size0, n=MAX_TILES):
     return c[(g[:, 0] % k == 0) & (g[:, 1] % k == 0)]
 
 
+def _read_mha(path):
+    """Minimal MetaImage reader (local data, raw or zlib): returns the 2-D array."""
+    import zlib
+    raw = open(path, "rb").read(); i = raw.index(b"ElementDataFile"); j = raw.index(b"\n", i) + 1
+    hdr = dict(l.split("=", 1) for l in raw[:j].decode("latin-1").splitlines() if "=" in l); hdr = {k.strip(): v.strip() for k, v in hdr.items()}
+    assert hdr.get("ElementDataFile", "LOCAL") == "LOCAL", "detached MetaImage data"
+    dims = [int(v) for v in hdr["DimSize"].split()]
+    dt = {"MET_UCHAR": np.uint8, "MET_CHAR": np.int8, "MET_USHORT": np.uint16, "MET_SHORT": np.int16, "MET_UINT": np.uint32,
+          "MET_INT": np.int32, "MET_FLOAT": np.float32, "MET_DOUBLE": np.float64}[hdr["ElementType"]]
+    data = raw[j:]
+    if hdr.get("CompressedData", "False").lower() == "true":
+        data = zlib.decompress(data)
+    ch = int(hdr.get("ElementNumberOfChannels", 1))
+    a = np.frombuffer(data, dt)[: int(np.prod(dims)) * ch].reshape(list(reversed(dims)) + ([ch] if ch > 1 else []))
+    while a.ndim > 2 and a.shape[0] == 1:
+        a = a[0]
+    return a[..., 0] if a.ndim == 3 else a
+
+
 def read_mask(path):
-    import openslide
-    ms = openslide.OpenSlide(path)
-    m = np.asarray(ms.read_region((0, 0), 0, ms.level_dimensions[0]))[..., 0] > 0
-    ms.close(); return m
+    """Tissue mask at full resolution as bool, plus its pixel spacing in um (None if unknown). Tissue is value 1 where
+    the mask uses 1, as in the organisers' faithfulness notebook, otherwise any value > 0. TIFF page 0 is read with
+    tifffile (any tiling, bit depth or photometric), .mha with a small MetaImage reader, anything else with openslide."""
+    spacing = None
+    if str(path).lower().endswith(".mha"):
+        m = _read_mha(path)
+    else:
+        try:
+            import tifffile
+            with tifffile.TiffFile(path) as t:
+                m = t.pages[0].asarray()
+            try:
+                spacing = tiff_mpp(path)
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"mask: tifffile failed ({type(e).__name__}: {e}); reading with openslide")
+            import openslide
+            ms = openslide.OpenSlide(path)
+            m = np.asarray(ms.read_region((0, 0), 0, ms.level_dimensions[0]))[..., 0]; ms.close()
+    if m.ndim == 3:
+        m = m[..., 0]
+    one = m == 1
+    return (one if one.any() else m > 0), spacing
 
 
 # ------------------------------------------------------------------ tiles -> embeddings
@@ -148,8 +212,12 @@ class Reader:
             self.local.s = self.os.OpenSlide(self.path)
         try:
             r = self.local.s.read_region((int(xy[0]), int(xy[1])), 0, (size, size))
-        except self.os.OpenSlideError:
-            del self.local.s; return None
+        except Exception:                                     # a bad tile is skipped, never fatal
+            try:
+                del self.local.s
+            except Exception:
+                pass
+            return None
         bg = Image.new("RGB", r.size, (255, 255, 255)); bg.paste(r, mask=r.split()[3])
         return np.asarray(bg.resize((TILE_PX, TILE_PX), Image.BILINEAR))
 
@@ -158,10 +226,16 @@ class Reader:
 def embed(M, wsi, coords, size, bs=64, fn=None):
     rd = Reader(wsi, threads=min(16, os.cpu_count() or 4)); q = queue.Queue(maxsize=4)
 
+    err = []
+
     def prod():
-        for i in range(0, len(coords), bs):
-            q.put(list(rd.pool.map(lambda c: rd.one(c, size), coords[i:i + bs])))
-        q.put(None)
+        try:
+            for i in range(0, len(coords), bs):
+                q.put(list(rd.pool.map(lambda c: rd.one(c, size), coords[i:i + bs])))
+        except BaseException as e:                            # never leave the consumer waiting
+            err.append(e)
+        finally:
+            q.put(None)
     threading.Thread(target=prod, daemon=True).start()
     out, ok = [], []
     while (b := q.get()) is not None:
@@ -170,6 +244,10 @@ def embed(M, wsi, coords, size, bs=64, fn=None):
             x = torch.from_numpy(np.stack([t for t in b if t is not None])).to(M["dev"]).permute(0, 3, 1, 2).float().div_(255)
             out.append((fn or f_midnight)(M, x))
     rd.pool.shutdown()
+    if err:
+        raise err[0]
+    if not out:
+        return None, np.array(ok + [False] * (len(coords) - len(ok)), bool)
     if isinstance(out[0], dict):
         return {k: torch.cat([o[k] for o in out]) for k in out[0]}, np.array(ok)
     return torch.cat(out), np.array(ok)
@@ -357,51 +435,50 @@ def paint(vals, all_xy, size0, mscale, mask):
     return out
 
 
-def write_report(path, sl, info, tiles_up, tiles_down, heat_small):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib.backends.backend_pdf import PdfPages
-    from matplotlib.colors import LinearSegmentedColormap
-    cm = LinearSegmentedColormap.from_list("rb", ["#2166ac", "#f7f7f7", "#b2182b"])
-    thumb = np.asarray(sl.get_thumbnail((1400, 1400)).convert("RGB"))
-    hs = np.asarray(Image.fromarray(heat_small).resize((thumb.shape[1], thumb.shape[0]), Image.NEAREST)).astype(float)
-    over = np.ma.masked_where(hs == 0, (hs - 128) / 127)
-    with PdfPages(path) as pdf:
-        f = plt.figure(figsize=(8.27, 11.69))
-        f.text(0.07, 0.955, "Computational recurrence-risk report", size=17, weight="bold")
-        f.text(0.07, 0.935, "Research use only. Not a diagnostic test. Grading was not used by this model.", size=8.5, color="#555")
-        lines = [f"Estimated risk group: {info['group'].upper()}",
-                 f"Relative risk score: {info['z']:+.2f} SD (training-cohort percentile {info['pct']:.0f})",
-                 f"Predicted time to biochemical recurrence (ranking value): {info['years']:.1f} years",
-                 f"Tissue: about {info['mm2']:.0f} mm2 sampled; {info['n_tiles']:,} fields of 112 x 112 um analysed"]
-        for i, s in enumerate(lines):
-            f.text(0.07, 0.90 - i * 0.022, s, size=10.5, weight="bold" if i == 0 else None)
-        a1 = f.add_axes([0.05, 0.42, 0.44, 0.38]); a1.imshow(thumb); a1.set_title("Specimen overview", size=9); a1.axis("off")
-        a2 = f.add_axes([0.51, 0.42, 0.44, 0.38]); a2.imshow(thumb); a2.imshow(over, cmap=cm, vmin=-1, vmax=1, alpha=0.6)
-        a2.set_title("Where the estimate comes from", size=9); a2.axis("off")
-        txt = ("How to read the map. Fields are ordered by sequential knockout: the field whose removal lowers the "
-               "estimate most comes first, every effect is recomputed exactly, and so on. Red regions raise the "
-               "estimate, blue regions lower it; the strongest colours are the first and last in that order. Each "
-               "region takes the value of the analysed field it surrounds. The model saw the tissue as "
-               "112 um fields at 20x and learned which patterns accompanied recurrence in 806 prostatectomy cases "
-               "(Radboudumc and TCGA). Page 2 shows the fields with the largest contributions in each direction for "
-               "the pathologist to review.\n\nLimitations. Trained on Radboudumc and TCGA cohorts; scanner and "
-               "staining differences can shift scores. Contributions show association with the model output, not "
-               "causation. Ink, folds and out-of-focus areas are filtered automatically but may remain.")
-        f.text(0.07, 0.36, txt, size=9, wrap=True, va="top", ha="left")
-        pdf.savefig(f); plt.close(f)
-        f = plt.figure(figsize=(8.27, 11.69))
-        f.text(0.07, 0.955, "Fields with the largest contributions (112 um, 20x)", size=13, weight="bold")
-        for r, (title, T) in enumerate((("Pushing towards recurrence", tiles_up), ("Pushing towards no recurrence", tiles_down))):
-            f.text(0.07, 0.915 - r * 0.45, title, size=10.5, color="#b2182b" if r == 0 else "#2166ac", weight="bold")
-            for k, (im, xy_mm, cv) in enumerate(T[:6]):
-                ax = f.add_axes([0.05 + (k % 3) * 0.31, 0.71 - r * 0.45 - (k // 3) * 0.2, 0.28, 0.18])
-                ax.imshow(im); ax.axis("off"); ax.set_title(f"x {xy_mm[0]:.1f} mm, y {xy_mm[1]:.1f} mm  ({cv:+.3f})", size=7)
-        pdf.savefig(f); plt.close(f)
+def faith_patch_px(sl, W, mask_w, mpp0, size=256, spacing=0.5):
+    """The faithfulness notebook's patch (mask_tile_size: `size` px at the slide level closest to `spacing` um/px) in
+    mask pixels; None if it is not a whole number (the notebook then stops for that slide)."""
+    ds = [W / lw for lw, _ in sl.level_dimensions]
+    lev = int(np.argmin([abs(d - spacing / mpp0) for d in ds]))
+    t = size * int(round(spacing / (mpp0 * ds[lev]))) * ds[lev] * mask_w / W
+    return int(round(t)) if t >= 1 and abs(t - round(t)) < 0.01 else None
 
 
-# 101 quantiles of development out-of-fold risk scores (deployed folds; model/owl_v2/oof.npz 'ens'), for the report's percentile
+def heat_patches(c, order, kxy, s20, mscale, mask, tile, view=None):
+    """uint8 map on the faithfulness patch grid (patches of `tile` mask px from (0, 0)). The fields that sequential
+    knockout removes (c > 0) are taken in order and each patch their mask window overlaps gets the next rank
+    (255 ... 130, earliest first), so removing the top patches removes those fields whole and in knockout order (a
+    field leaves the bag once < 25% of its window is tissue). Tissue the model did not read (removing it changes
+    nothing) takes 3 ... 129 from `view`, the order spread from the nearest read field, so the map reads as a
+    continuous picture without changing what removing the top patches does; patches touching only fields whose
+    removal would raise the score get 1 (removed last); outside the mask 0."""
+    h, w = mask.shape; gh, gw = -(-h // tile), -(-w // tile)
+    x0 = np.clip((kxy[:, 0] / mscale).astype(int), 0, w); y0 = np.clip((kxy[:, 1] / mscale).astype(int), 0, h)
+    x1 = np.clip(((kxy[:, 0] + s20) / mscale).astype(int), 0, w); y1 = np.clip(((kxy[:, 1] + s20) / mscale).astype(int), 0, h)
+    x1 = np.maximum(x1, np.minimum(x0 + 1, w)); y1 = np.maximum(y1, np.minimum(y0 + 1, h))
+    r0, r1, q0, q1 = y0 // tile, (y1 - 1) // tile, x0 // tile, (x1 - 1) // tile
+    G = np.full((gh, gw), 2, np.uint8)
+    if view is not None:                                    # unread tissue: the spread order, below every read field
+        rr_, qq_ = np.minimum(np.arange(gh) * tile + tile // 2, h - 1), np.minimum(np.arange(gw) * tile + tile // 2, w - 1)
+        Vc = view[rr_][:, qq_].astype(np.int32)
+        G = np.clip(3 + (126 * np.maximum(Vc - 1, 0)) // 254, 3, 129).astype(np.uint8)
+    for t in order:
+        if c[t] <= 0:
+            G[r0[t]:r1[t] + 1, q0[t]:q1[t] + 1] = 1
+    seen = np.zeros((gh, gw), bool); seq = []
+    for t in order:
+        if c[t] > 0:
+            for r in range(r0[t], r1[t] + 1):
+                for q in range(q0[t], q1[t] + 1):
+                    if not seen[r, q]:
+                        seen[r, q] = True; seq.append((r, q))
+    if seq:
+        rr, qq = np.array(seq).T
+        G[rr, qq] = (255 - np.floor(126 * np.arange(len(seq)) / len(seq))).astype(np.uint8)
+    out = np.repeat(np.repeat(G, tile, 0), tile, 1)[:h, :w]; out[~mask] = 0
+    return out
+
+
 REF_Q = [-1.6560, -1.4729, -1.4002, -1.3542, -1.2884, -1.2465, -1.1966, -1.1535, -1.1287, -1.1096, -1.0577, -1.0303, -1.0032, -0.9781, -0.9542, -0.9320, -0.9121, -0.8915, -0.8629, -0.8318, -0.8121, -0.7777, -0.7696, -0.7549, -0.7277, -0.7033, -0.6935, -0.6639, -0.6513, -0.6164, -0.5941, -0.5755, -0.5538, -0.5343, -0.5064, -0.4809, -0.4697, -0.4420, -0.4130, -0.3978, -0.3818, -0.3661, -0.3439, -0.3265, -0.3029, -0.2850, -0.2585, -0.2302, -0.2042, -0.1936, -0.1777, -0.1489, -0.1369, -0.1072, -0.0819, -0.0619, -0.0292, -0.0189, 0.0124, 0.0422, 0.0648, 0.0945, 0.1217, 0.1423, 0.1782, 0.2110, 0.2389, 0.2879, 0.3340, 0.3683, 0.4074, 0.4502, 0.4868, 0.5178, 0.5536, 0.6097, 0.6507, 0.6864, 0.7147, 0.7615, 0.8163, 0.8661, 0.9317, 0.9972, 1.0664, 1.1253, 1.1786, 1.2361, 1.2890, 1.3345, 1.3734, 1.4475, 1.5121, 1.5667, 1.6180, 1.6927, 1.8097, 1.9148, 2.0418, 2.1693, 3.0853]
 
 
@@ -409,7 +486,10 @@ REF_Q = [-1.6560, -1.4729, -1.4002, -1.3542, -1.2884, -1.2465, -1.1966, -1.1535,
 # Three kinds of statement, labelled on the page: computed model response (exact score change when fields are excluded),
 # automated image estimate (model-generated tissue label or measurement), development outcome evidence (earlier patients).
 # Sign convention everywhere: score change = score after exclusion - original score (negative = lower score).
-REF = json.load(open(Path(__file__).with_name("report_ref.json")))
+try:
+    REF = json.load(open(Path(__file__).with_name("report_ref.json")))
+except Exception:                                           # report reference missing: the report falls back, the prediction does not need it
+    REF = {}
 COMP_LABEL = ["Epithelium-enriched glands", "Benign-type glands", "Stroma", "Other tissue"]
 NUC_SHOW = [(0, "estimated nuclear density"), (1, "estimated nuclear size"), (3, "nuclear staining (haematoxylin)"), (4, "estimated nuclear crowding")]
 REFS = [
@@ -423,6 +503,17 @@ REFS = [
     "Veltri RW, Christudass CS, Isharwal S. Nuclear morphometry, nucleomics and prostate cancer progression. Asian J Androl. 2012;14(3):375-84. doi:10.1038/aja.2011.148.",
     "Howard FM, Dolezal J, Kochanny S, et al. The impact of site-specific digital histology signatures on deep learning model accuracy and bias. Nat Commun. 2021;12:4423. doi:10.1038/s41467-021-24698-1.",
 ]
+
+
+def ordinal(x):
+    """93 -> '93rd'; rounds first, so the printed number and its suffix always agree."""
+    n = int(round(float(x))); suf = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suf}"
+
+
+def pct_ord(x):
+    """A percentile for display: 1st to 99th (a field or case cannot sit at the 0th or 100th of a reference)."""
+    return ordinal(min(99, max(1, int(round(float(x))))))
 
 
 def pct_of(z, q):
@@ -459,13 +550,23 @@ def report_data(M, Xm, A, V, w, c_single, order, kxy, s20, mpp0, per):
     def describe(i):
         if comp is None:
             return ""
-        parts = [f"{name} near the {pct[k][i]:.0f}th percentile of this slide's sampled fields"
+        parts = [f"{name} near the {pct_ord(pct[k][i])} percentile of this slide's sampled fields"
                  for k, name in sorted(NUC_SHOW, key=lambda t: -abs(pct[t[0]][i] - 50))[:2]]
         return f"{COMP_LABEL[comp[i]].lower()}; " + "; ".join(parts)
     field = lambda i: dict(i=i, mm=(kxy[i] + s20 / 2) * mpp0 / 1000, chg=-float(c_single[i]) / sd, desc=describe(i),
-                           comp=None if comp is None else int(comp[i]))
+                           comp=None if comp is None else int(comp[i]),
+                           nuc=None if pct is None else {name: float(pct[k][i]) for k, name in NUC_SHOW})
     d["up"], d["dn"] = [field(i) for i in up], [field(i) for i in dn]
+    sel_ = lambda ids: np.isin(np.arange(n), ids)
+    d["up6"] = excl_change(A, V, w, sel_(up)) / sd              # the listed fields removed together
+    d["top"] = [(fr, int(max(1, round(fr * n))), excl_change(A, V, w, sel_(order[:max(1, round(fr * n))])) / sd) for fr in (0.01, 0.05, 0.10)]
     d["enc"] = {e: pct_of(per[e], REF["enc_q"][e]) for e in per}
+    if comp is not None:                                  # slide-level morphology measures, as in the development reference (E55)
+        bio = dict(epi_share=float((comp == 0).mean()), stroma_share=float((comp == 2).mean()), n_epi=int((comp == 0).sum()))
+        if bio["n_epi"] >= 40:
+            for k, nm in enumerate(("n_dens", "area_mu", "area_cv", "hema_mu", "deg20", "small_dark")):
+                bio[nm] = float(np.median(nuc[comp == 0, k]))
+        d["bio"] = bio
     if comp is not None:
         rows = []
         for q in range(4):
@@ -483,283 +584,493 @@ def report_data(M, Xm, A, V, w, c_single, order, kxy, s20, mpp0, per):
     return d
 
 
-def write_report_v4(path, sl, info, d, crops, heat_small):
-    import textwrap
+# report v5 colours and units
+INK, MUTED, LINE, PANEL, HEAD, NAVY = "#1b2232", "#5a6273", "#cdd3dc", "#f4f6f9", "#e7ebf1", "#17325c"
+BAND_C = {"low": "#2c7a5e", "medium": "#b8740f", "high": "#ad2c45"}
+OK_C, WARN_C, NA_C = "#2c7a5e", "#b8740f", "#8a92a1"
+RED, BLUE = "#ad2c45", "#2a5fa3"
+PT = 1 / 842                                              # one point in figure height units (A4)
+
+
+def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
+    """Morphology report laid out like a genomic (NGS) test report: page 1 report highlights (specimen and test, the
+    result, morphology findings against development reference ranges with their effect on the result, interpretation,
+    pathologist verification, quality metrics); page 2 evidence regions; page 3 findings in detail; page 4 outcomes by
+    band in the development cohorts; page 5 methods, quality definitions, limitations and references."""
+    import datetime, textwrap
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.backends.backend_pdf import PdfPages
     from matplotlib.colors import LinearSegmentedColormap
-    INK, MUTED, RED, BLUE, GRID, ACC = "#1f1b2e", "#5d5872", "#b2182b", "#2166ac", "#e4e1ea", "#3b5b92"
-    BANDC = {"low": "#7a8fb5", "medium": "#c08a3e", "high": "#9c3d54"}
-    cm = LinearSegmentedColormap.from_list("rb", ["#2166ac", "#f7f7f7", "#b2182b"])
-    plt.rcParams.update({"font.family": "DejaVu Sans", "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": MUTED,
-                         "ytick.color": MUTED, "axes.linewidth": 0.6})
-    W_ = lambda s, n=112: textwrap.fill(s, n)
-    thumb = np.asarray(sl.get_thumbnail((1400, 1400)).convert("RGB")); W0 = sl.level_dimensions[0][0]; fx = thumb.shape[1] / W0
+    from matplotlib.patches import FancyBboxPatch, Rectangle, FancyArrowPatch
+    REF, REFS, COMP_LABEL, ordinal, ref_pct = K["REF"], K["REFS"], K["COMP_LABEL"], K["ordinal"], K["ref_percentile"]
+    plt.rcParams.update({"font.family": "DejaVu Sans", "axes.edgecolor": MUTED, "axes.linewidth": 0.6,
+                         "xtick.color": MUTED, "ytick.color": MUTED})
+    cm = LinearSegmentedColormap.from_list("rb", ["#2a5fa3", "#f5f5f5", "#ad2c45"])
+    band, P, z, sd = info["group"], float(info["pct"]), float(info["z"]), float(d["sd"])
+    case = info.get("case", "").replace("Case ", "")
+    po = lambda x: ordinal(min(99, max(1, int(round(float(x))))))
+    Pd, Pn = po(P), min(99, max(1, int(round(P))))
+    band_of = lambda p: "low" if p < 50 else "medium" if p < 80 else "high"
+    after = lambda dz_sd: ref_pct(z + dz_sd * sd)              # percentile after an exclusion (change in SD)
+    fx = thumb.shape[1] / W0
     hs = np.asarray(Image.fromarray(heat_small).resize((thumb.shape[1], thumb.shape[0]), Image.NEAREST)).astype(float)
     over = np.ma.masked_where(hs == 0, (hs - 128) / 127)
-    band, P = info["group"], info["pct"]; case = info.get("case", "")
+    BIO = REF.get("bio", {}).get("measures", {}); bio = d.get("bio", {})
+    ref_of = lambda nm, v: float(np.interp(v, BIO[nm]["q"], np.linspace(0, 100, len(BIO[nm]["q"])))) if nm in BIO and v is not None else None
 
-    def frame(f, title, page, sub=None):
-        f.text(0.07, 0.962, title, size=14.5, weight="bold", color=INK)
+    def wrap(s, w, size):
+        return textwrap.fill(s, max(18, int(w * 595 / (0.54 * size))))
+
+    def text(f, x, y, s, size=8.0, w=0.86, color=INK, weight="normal", lh=1.36, ha="left"):
+        t = wrap(s, w, size); f.text(x, y, t, size=size, va="top", ha=ha, color=color, weight=weight, linespacing=lh)
+        return y - (t.count("\n") + 1) * size * lh * PT - 0.003
+
+    def rbox(f, x, y0, w, h, fc="white", ec=LINE, lw=0.8):
+        f.add_artist(FancyBboxPatch((x, y0), w, h, boxstyle="round,pad=0,rounding_size=0.005", transform=f.transFigure, fc=fc, ec=ec, lw=lw, zorder=-2))
+
+    def section(f, x, y_top, w, h, title, accent=NAVY):
+        rbox(f, x, y_top - h, w, h)
+        f.add_artist(Rectangle((x, y_top - 0.022), w, 0.022, transform=f.transFigure, fc=HEAD, ec="none", zorder=-1))
+        f.add_artist(Rectangle((x, y_top - 0.022), 0.004, 0.022, transform=f.transFigure, fc=accent, ec="none", zorder=-1))
+        f.text(x + 0.012, y_top - 0.011, title.upper(), size=7.4, weight="bold", color=accent, va="center")
+        return y_top - 0.032
+
+    def chip(f, x, y, label, color, size=6.8):
+        wdt = 0.014 + 0.0058 * len(label) * size / 6.8
+        f.add_artist(FancyBboxPatch((x, y - 0.0075), wdt, 0.015, boxstyle="round,pad=0,rounding_size=0.004", transform=f.transFigure, fc=color, ec="none"))
+        f.text(x + wdt / 2, y, label, size=size, color="white", weight="bold", va="center", ha="center")
+
+    def checkbox(f, x, y, label, size=7.0):
+        sw = 0.0095; shh = sw * 8.27 / 11.69                  # square on the page
+        f.add_artist(Rectangle((x, y - shh / 2), sw, shh, transform=f.transFigure, fc="white", ec=INK, lw=0.7))
+        f.text(x + sw + 0.006, y, label, size=size, va="center", color=INK)
+        return x + sw + 0.006 + len(label) * size * 0.56 / 595 + 0.022
+
+    def header(f, title, page, sub=None):
+        f.add_artist(Rectangle((0, 0.952), 1, 0.048, transform=f.transFigure, fc=NAVY, ec="none"))
+        f.text(0.06, 0.981, "KNOX  MORPHOLOGY SEQUENCING REPORT", size=11, weight="bold", color="white", va="center")
+        f.text(0.06, 0.962, "Recurrence-risk ranking from radical prostatectomy H&E", size=7.6, color="#c9d6ea", va="center")
+        f.text(0.94, 0.976, "RESEARCH USE ONLY", size=7.8, weight="bold", color="#ffd2da", va="center", ha="right")
+        f.text(0.94, 0.961, f"Specimen {case}", size=7.2, color="#c9d6ea", va="center", ha="right")
+        f.text(0.06, 0.930, title, size=12.5, weight="bold", color=INK, va="center")
+        y = 0.914
         if sub:
-            f.text(0.07, 0.945, sub, size=8, color=MUTED, va="top")
-        f.add_artist(plt.Line2D([0.07, 0.93], [0.035, 0.035], color=GRID, lw=0.8, transform=f.transFigure))
-        f.text(0.07, 0.022, f"KNOX research recurrence-ranking report  |  {case}  |  development-stage research test; clinical utility "
-               "has not been established", size=6.6, color=MUTED)
-        f.text(0.93, 0.022, f"page {page} of 5", size=6.6, color=MUTED, ha="right")
+            y = text(f, 0.06, 0.914, sub, size=7.5, w=0.88, color=MUTED)
+        f.add_artist(plt.Line2D([0.06, 0.94], [0.036, 0.036], color=LINE, lw=0.8, transform=f.transFigure))
+        f.text(0.06, 0.024, "KNOX 1.0 (development). Research use only: not for diagnosis or treatment decisions; clinical utility has not "
+               "been established.", size=6.3, color=MUTED)
+        f.text(0.94, 0.024, f"Page {page} of 5", size=6.3, color=MUTED, ha="right")
+        return y - 0.006
 
-    def para(f, x, y, s, size=8.4, n=112, color=INK, lh=0.0128):
-        t = W_(s, n); f.text(x, y, t, size=size, va="top", color=color); return y - lh * (t.count("\n") + 1)
-
-    def marks(ax, fields, color, labels):
+    def marks(ax, fields, color, labels, ms=6):
         for lab, fd in zip(labels, fields):
             cx, cy = fd["mm"][0] * 1000 / info["mpp0"] * fx, fd["mm"][1] * 1000 / info["mpp0"] * fx
-            ax.plot(cx, cy, "o", ms=5, mfc="none", mec=color, mew=1.1); ax.text(cx + 9, cy - 9, lab, color=color, size=7.5, weight="bold")
+            ax.plot(cx, cy, "o", ms=ms, mfc="none", mec=color, mew=1.3); ax.text(cx + 10, cy - 10, lab, color=color, size=7.2, weight="bold")
+
+    def refbar(f, x, y, w, nm, v, h=0.011):
+        """Reference-range bar: development 10th to 90th percentile shaded, median tick, this slide's value marked."""
+        q = BIO[nm]["q"]; lo, hi = q[0], q[100]; span = max(hi - lo, 1e-9); X = lambda t: x + w * (min(max(t, lo), hi) - lo) / span
+        f.add_artist(Rectangle((x, y - h / 2), w, h, transform=f.transFigure, fc=PANEL, ec=LINE, lw=0.5))
+        f.add_artist(Rectangle((X(q[10]), y - h / 2), X(q[90]) - X(q[10]), h, transform=f.transFigure, fc="#d9e1ee", ec="none"))
+        f.add_artist(plt.Line2D([X(q[50])] * 2, [y - h / 2, y + h / 2], color=MUTED, lw=0.8, transform=f.transFigure))
+        f.add_artist(plt.Line2D([X(v)] * 2, [y - h * 0.9, y + h * 0.9], color=INK, lw=2.0, transform=f.transFigure))
+
+    # ---- numbers used on several pages
+    enc = d["enc"]; bands_e = {e: band_of(p_) for e, p_ in enc.items()}; n_agree = sum(b_ == band for b_ in bands_e.values())
+    dist = min(abs(P - 50), abs(P - 80)); near = 50 if abs(P - 50) < abs(P - 80) else 80
+    km = REF["km"]["owl"]; g_ = np.asarray(km["grid"]); i5 = int(np.searchsorted(g_, 5.0, side="right") - 1)
+    bcr5 = {b: 100 * (1 - km["bands"][b]["s"][i5]) for b in ("low", "medium", "high")}
+    kmt = REF["km"]["tcga"]; gt = np.asarray(kmt["grid"]); i3 = int(np.searchsorted(gt, 3.0, side="right") - 1)
+    bcr3t = {b: 100 * (1 - kmt["bands"][b]["s"][i3]) for b in ("low", "medium", "high")}
+    up6 = after(d["up6"]) if "up6" in d else None
+    top = [(fr, k_, after(v)) for fr, k_, v in d.get("top", [])]
+    comp_after = {r[0]: (r[1], r[2], after(r[3])) for r in d.get("comp_rows", [])}
+    EPI, STR = COMP_LABEL[0], COMP_LABEL[2]
+    dn_ = d.get("dens", {})
+    n_epi = bio.get("n_epi", 0)
+    tissue_ok = "Adequate" if d["n"] >= 500 else "Limited" if d["n"] >= 100 else "Insufficient"
+    epi_ok = "Adequate" if n_epi >= 40 else "Low"
+
+    # morphology findings (rows: label, this slide, development reference percentile, effect on result)
+    FIND = []
+    if "epi_share" in bio:
+        eff = f"removing it: {Pd} to {po(comp_after[EPI][2])}" if EPI in comp_after else "not tested"
+        FIND.append(("Epithelium-enriched glands", f"{100 * bio['epi_share']:.0f}% of tissue read", ref_of("epi_share", bio["epi_share"]), eff, "epi_share"))
+    if "n_dens" in bio:
+        eff = (f"densest quarter removed: to {po(after(dn_['hi']))}; least dense: to {po(after(dn_['lo']))}") if "hi" in dn_ else "not tested"
+        FIND.append(("Nuclear density in gland epithelium", f"{bio['n_dens']:,.0f} per mm²", ref_of("n_dens", bio["n_dens"]), eff, "n_dens"))
+        FIND.append(("Nuclear size in gland epithelium", f"{bio['area_mu']:.0f} µm²", ref_of("area_mu", bio["area_mu"]), "", "area_mu"))
+        FIND.append(("Chromatin density (haematoxylin)", f"{bio['hema_mu']:.2f} (a.u.)", ref_of("hema_mu", bio["hema_mu"]), "", "hema_mu"))
+        FIND.append(("Nuclear crowding (neighbours in 20 µm)", f"{bio['deg20']:.1f}", ref_of("deg20", bio["deg20"]), "", "deg20"))
+    if "stroma_share" in bio:
+        eff = f"removing it: {Pd} to {po(comp_after[STR][2])}" if STR in comp_after else "not tested"
+        FIND.append(("Stroma", f"{100 * bio['stroma_share']:.0f}% of tissue read", ref_of("stroma_share", bio["stroma_share"]), eff, "stroma_share"))
+
+    # interpretation (rule-based, plain words)
+    moves = sorted(((abs(v[2] - P), k_) for k_, v in comp_after.items()), reverse=True)
+    interp = [f"This slide ranks in the {band} band, at the {Pd} percentile of 806 development patients."]
+    if moves:
+        interp.append(f"The ranking rests mainly on {moves[0][1].lower()}: without it the result would move from the {Pd} to the "
+                      f"{po(comp_after[moves[0][1]][2])} percentile.")
+    if "hi" in dn_:
+        mh, ml = abs(after(dn_["hi"]) - P), abs(after(dn_["lo"]) - P)
+        pts = lambda v: "less than 1 percentile point" if v < 1 else f"{v:.0f} percentile point{'s' if round(v) != 1 else ''}"
+        interp.append(f"Within the gland epithelium, the ranking leans on fields with {'dense' if mh > ml else 'sparse'} nuclei: removing the "
+                      f"densest quarter moves it by {pts(mh)}, removing the least dense quarter by {pts(ml)}.")
+    n_ep = sum(1 for fd in d["up"][:6] if fd.get("comp") == 0)
+    if d["up"]:
+        interp.append(f"{n_ep} of the {min(6, len(d['up']))} evidence regions on page 2 are epithelium-enriched glands by automated estimate; "
+                      "their identity as carcinoma needs the pathologist's confirmation.")
+    interp.append(f"In the Radboudumc development cohort, {bcr5[band]:.0f}% of patients in the {band} band had biochemical recurrence within "
+                  f"5 years (low {bcr5['low']:.0f}%, medium {bcr5['medium']:.0f}%, high {bcr5['high']:.0f}%).")
 
     with PdfPages(path) as pdf:
-        # ---------------- page 1: the result and what it means
+        # ============================================================ page 1: report highlights
         f = plt.figure(figsize=(8.27, 11.69))
-        frame(f, f"{case}: {P:.0f}th percentile of the development reference", 1)
-        y = 0.93
-        y = para(f, 0.07, y, f"This slide's model score is higher than about {P:.0f}% of scores in the development reference and falls in the "
-                 f"study-defined {band} band. It is a relative ranking, not a probability of recurrence and not a time to recurrence. The model "
-                 "is in development: results on the challenge's hidden test centres are not yet available, and this report does not show how "
-                 "the result should change follow-up or treatment.", size=9.2, n=104, lh=0.0138) - 0.012
-        ax = f.add_axes([0.10, y - 0.045, 0.80, 0.022]); ax.set_xlim(0, 100); ax.set_ylim(0, 1); ax.set_yticks([])
+        header(f, "Report highlights", 1)
+        # specimen | test
+        rbox(f, 0.06, 0.835, 0.43, 0.068); rbox(f, 0.51, 0.835, 0.43, 0.068)
+        for x0, title, rows in ((0.06, "SPECIMEN", [("Specimen ID", case), ("Type", "Radical prostatectomy"), ("Material", "H&E whole-slide image"),
+                                                    ("Scan", f"{info['mpp0']:.3f} µm per pixel")]),
+                                (0.51, "TEST", [("Test", "KNOX 1.0 (development)"), ("Reference", "806 development patients"),
+                                                ("Models", ensemble), ("Report date", datetime.date.today().isoformat())])):
+            f.text(x0 + 0.012, 0.894, title, size=6.8, weight="bold", color=NAVY, va="top")
+            for k_, (lab, val) in enumerate(rows):
+                yy = 0.879 - k_ * 0.0105
+                f.text(x0 + 0.012, yy, lab, size=6.8, color=MUTED, va="top"); f.text(x0 + 0.105, yy, wrap(val, 0.31, 6.8).split("\n")[0], size=6.9, color=INK, va="top")
+        # result
+        rbox(f, 0.06, 0.72, 0.88, 0.105, ec=BAND_C[band], lw=1.4)
+        f.add_artist(Rectangle((0.06, 0.72), 0.24, 0.105, transform=f.transFigure, fc=BAND_C[band], ec="none", zorder=-1))
+        f.text(0.18, 0.806, "RISK BAND", size=7.2, color="white", ha="center", va="center", weight="bold")
+        f.text(0.18, 0.772, band.upper(), size=27, color="white", ha="center", va="center", weight="bold")
+        f.text(0.18, 0.737, f"{Pd} percentile", size=9, color="white", ha="center", va="center", weight="bold")
+        f.text(0.325, 0.810, "Morphology recurrence-risk ranking", size=9.2, weight="bold", color=INK, va="center")
+        ax = f.add_axes([0.33, 0.770, 0.58, 0.018]); ax.set_xlim(0, 100); ax.set_ylim(0, 1); ax.set_yticks([])
         for lo_, hi_, b in ((0, 50, "low"), (50, 80, "medium"), (80, 100, "high")):
-            ax.axvspan(lo_, hi_, color=BANDC[b], alpha=0.35 if b != band else 0.75, lw=0)
-            ax.text((lo_ + hi_) / 2, 1.35, f"{b}  ({lo_}th to {hi_}th)" if b != "high" else "high  (80th and above)", ha="center", size=7, color=INK)
-        ax.plot([P, P], [-0.2, 1.2], color=INK, lw=2); ax.text(P, -1.6, f"this case: {P:.0f}", ha="right" if P > 88 else "left" if P < 12 else "center", size=7.5, weight="bold", color=INK)
-        ax.set_xticks([0, 50, 80, 100]); ax.tick_params(labelsize=6.5, length=2); [s_.set_visible(False) for s_ in ax.spines.values()]
-        y -= 0.10
-        hgt = 0.30; a1 = f.add_axes([0.05, y - hgt, 0.44, hgt]); a1.imshow(thumb); a1.axis("off"); a1.set_title("H&E overview", size=8.5)
-        a2 = f.add_axes([0.51, y - hgt, 0.44, hgt]); a2.imshow(thumb); im = a2.imshow(over, cmap=cm, vmin=-1, vmax=1, alpha=0.6)
-        a2.axis("off"); a2.set_title("Removal-order map (the submitted attribution map)", size=8.5)
+            ax.axvspan(lo_, hi_, color=BAND_C[b], alpha=0.9 if b == band else 0.22, lw=0)
+            ax.text((lo_ + hi_) / 2, 1.5, b.capitalize(), ha="center", size=7, color=INK, weight="bold" if b == band else "normal")
+        ax.plot([P, P], [-0.25, 1.25], color=INK, lw=2.2, clip_on=False)
+        ax.set_xticks([0, 50, 80, 100]); ax.set_xticklabels(["0", "50th", "80th", "100th"], size=6.3); ax.tick_params(length=2)
+        [s_.set_visible(False) for s_ in ax.spines.values()]
+        text(f, 0.325, 0.750, f"Higher than about {Pn}% of 806 development patients. A ranking, not a probability of recurrence for this "
+             "patient. Gleason grade, stage, margins and PSA were not used.", size=6.7, w=0.6, color=MUTED, lh=1.25)
+        # morphology findings table
+        nrow = len(FIND); th = 0.032 + 0.040 + nrow * 0.0235 + 0.012
+        y = section(f, 0.06, 0.705, 0.88, th, "Morphology findings")
+        cols = [0.075, 0.34, 0.47, 0.70]
+        for x_, h_ in zip(cols, ("Finding", "This slide", "Development reference", "Effect on the result")):
+            f.text(x_, y, h_, size=6.8, color=MUTED, weight="bold", va="top")
+        f.text(0.47, y - 0.012, "10th to 90th percentile shaded, median tick", size=5.8, color=MUTED, va="top")
+        y -= 0.030
+        for lab, val, pr, eff, nm in FIND:
+            f.add_artist(plt.Line2D([0.07, 0.93], [y + 0.008, y + 0.008], color=LINE, lw=0.5, transform=f.transFigure))
+            f.text(cols[0], y, lab, size=7.3, color=INK, va="top", weight="bold" if nm in ("epi_share", "n_dens") else "normal")
+            f.text(cols[1], y, val, size=7.3, color=INK, va="top")
+            if pr is not None:
+                refbar(f, cols[2], y - 0.0045, 0.14, nm, bio[nm] if nm in bio else 0)
+                f.text(cols[2] + 0.148, y, po(pr), size=6.8, color=INK, va="top")
+            if eff:
+                text(f, cols[3], y + 0.001, eff, size=6.6, w=0.23, color=INK, lh=1.2)
+            y -= 0.0235
+        text(f, 0.075, y + 0.004, "Effect: where the result would move if that tissue were removed from the analysis (exact recomputation). "
+             "Findings are automated estimates from the image; reference = the same measures on 806 development slides.", size=6.0, w=0.85, color=MUTED, lh=1.2)
+        y_int = 0.705 - th - 0.010
+        # interpretation
+        ih = 0.032 + 0.0145 * sum(len(wrap(s, 0.82, 7.8).split("\n")) for s in interp) + 0.006 * len(interp) + 0.006
+        y = section(f, 0.06, y_int, 0.88, ih, "Interpretation")
+        for s in interp:
+            f.text(0.078, y, "•", size=8.5, va="top", color=INK); y = text(f, 0.093, y, s, size=7.8, w=0.82) - 0.003
+        y_act = y_int - ih - 0.010
+        # pathologist verification
+        y = section(f, 0.06, y_act, 0.88, 0.096, "Pathologist verification before use", accent=RED)
+        y = text(f, 0.075, y, "The result depends most on the six regions shown on page 2. Confirm that they are carcinoma and free of artefact. "
+                 "If most are not carcinoma, or are artefact, treat the result as unreliable and do not report it.", size=7.7, w=0.85) - 0.006
+        xx = 0.08
+        for lab in ("Regions reviewed", "Mostly carcinoma", "No major artefact", "Result reportable"):
+            xx = checkbox(f, xx, y - 0.004, lab, 7.4)
+        f.text(0.08, y - 0.022, "Pathologist: ______________________     Date: ____________", size=7.2, color=INK, va="center")
+        y_q = y_act - 0.096 - 0.010
+        # quality metrics
+        qrows = [("Tissue read by the model", f"{d['n']:,} fields of 112 µm ({d['n'] * 0.012544:.0f} mm²)", tissue_ok, OK_C if tissue_ok == "Adequate" else WARN_C),
+                 ("Gland-epithelium fields", f"{n_epi:,}", epi_ok, OK_C if epi_ok == "Adequate" else WARN_C),
+                 ("Agreement of the three image models", f"{n_agree} of 3 in the {band} band", "Consistent" if n_agree == 3 else "Partial" if n_agree == 2 else "Inconsistent",
+                  OK_C if n_agree == 3 else WARN_C),
+                 ("Distance from the nearest band cut-off", f"{round(dist)} points from the {ordinal(near)} percentile", "Clear" if dist >= 5 else "Borderline",
+                  OK_C if dist >= 5 else WARN_C)]
+        qh = 0.032 + 0.0175 * len(qrows) + 0.004
+        y = section(f, 0.06, y_q, 0.88, qh, "Quality metrics")
+        for lab, val, st, col in qrows:
+            f.text(0.075, y, lab, size=7.3, color=INK, va="top"); f.text(0.42, y, val, size=7.2, color=INK, va="top"); chip(f, 0.80, y - 0.0055, st, col)
+            y -= 0.0175
+        # evidence overview (fills the rest of page 1)
+        y_e = y_q - qh - 0.010
+        if y_e - 0.05 > 0.12:
+            eh = y_e - 0.05
+            y = section(f, 0.06, y_e, 0.88, eh, "Where the evidence is")
+            ih_ = eh - 0.045; a1 = f.add_axes([0.075, 0.05 + 0.010, 0.40, ih_]); a1.imshow(thumb); a1.axis("off")
+            marks(a1, d["up"], RED, [str(k + 1) for k in range(len(d["up"]))], ms=5)
+            a2 = f.add_axes([0.525, 0.05 + 0.010, 0.40, ih_]); a2.imshow(thumb); a2.imshow(over, cmap=cm, vmin=-1, vmax=1, alpha=0.6); a2.axis("off")
+            f.text(0.275, y + 0.002, "H&E, evidence regions 1 to 6 (page 2)", size=6.6, color=MUTED, ha="center", va="top")
+            f.text(0.725, y + 0.002, "Removal order: red first, blue last", size=6.6, color=MUTED, ha="center", va="top")
+        pdf.savefig(f); plt.close(f)
+
+        # ============================================================ page 2: evidence regions
+        f = plt.figure(figsize=(8.27, 11.69))
+        y = header(f, "Evidence regions: what the result depends on", 2,
+                   "Regions are ranked by sequential removal: region 1 is the one whose removal lowers the result most, region 2 the next once "
+                   "region 1 is gone, and so on, each change computed exactly for this model. Left image: 448 µm surroundings with the region "
+                   "boxed; right image: the 112 µm region as read. Positions are in mm from the top-left corner of the scan.")
+        y -= 0.012; hgt = 0.150; a1 = f.add_axes([0.06, y - hgt, 0.43, hgt]); a1.imshow(thumb); a1.axis("off"); a1.set_title("H&E overview", size=7.3, color=MUTED)
+        a2 = f.add_axes([0.51, y - hgt, 0.43, hgt]); a2.imshow(thumb); a2.imshow(over, cmap=cm, vmin=-1, vmax=1, alpha=0.6); a2.axis("off")
+        a2.set_title("Removal order (red removed first, blue last)", size=7.3, color=MUTED)
         for a_ in (a1, a2):
-            marks(a_, d["up"], RED, [str(k + 1) for k in range(len(d["up"]))]); marks(a_, d["dn"], BLUE, "abc"[:len(d["dn"])])
-        y -= hgt + 0.012
-        cb = f.add_axes([0.58, y, 0.30, 0.008]); bar = f.colorbar(im, cax=cb, orientation="horizontal", ticks=[-1, 1])
-        bar.ax.set_xticklabels(["removed later", "removed earlier"], size=6.5); bar.outline.set_linewidth(0.4)
-        y = para(f, 0.07, y + 0.004, "Colour shows the order of sequential removal, not whether a field raises or lowers the score on its own.",
-                 size=7.2, n=60, color=MUTED) - 0.02
-        f.text(0.07, y, "Key findings for review", size=10.5, weight="bold", color=INK); y -= 0.022
-        kf = []
-        ep = [r for r in d.get("comp_rows", []) if r[0] == COMP_LABEL[0]]
-        if ep:
-            kf.append(f"Computed model response. Excluding all {ep[0][1]:,} epithelium-enriched gland fields changes the score by {ep[0][3]:+.2f} "
-                      "development-reference SD (page 3).")
-        if d["up"]:
-            f1 = d["up"][0]; lab = COMP_LABEL[f1["comp"]].lower() if f1["comp"] is not None else "unlabelled"
-            kf.append(f"The field selected first (field 1, page 2) carries the automated label \"{lab}\". Please confirm its tissue identity "
-                      "and check for artefact before relying on the result.")
-        dn_ = d.get("dens", {})
-        if "hi" in dn_:
-            kf.append(f"Computed model response. Within epithelium-enriched fields, excluding the densest quarter changes the score by "
-                      f"{dn_['hi']:+.2f} SD and excluding the least dense quarter by {dn_['lo']:+.2f} SD (page 3).")
-        for s in kf:
-            f.text(0.08, y, "•", size=9, va="top", color=INK); y = para(f, 0.10, y, s, size=8.4, n=106) - 0.008
-        y -= 0.008
-        bx = f.add_axes([0.07, 0.05, 0.86, y - 0.055]); bx.set_xticks([]); bx.set_yticks([])
-        [s_.set_color(GRID) for s_ in bx.spines.values()]
-        enc = d["enc"]; bands_e = {e: ("low" if p_ < 50 else "medium" if p_ < 80 else "high") for e, p_ in enc.items()}
-        agree = len(set(bands_e.values())) == 1
-        dist = min(abs(P - 50), abs(P - 80)); near = 50 if abs(P - 50) < abs(P - 80) else 80
-        qc = [f"Tissue-mask area: about {info['mm2']:.0f} mm². Analysed input: {d['n']:,} sampled fields of 112 x 112 µm on a fixed grid, "
-              f"about {d['n'] * 0.012544:.0f} mm².",
-              f"Fields excluded before analysis as mostly glass, lumen or fat: {info['filt']:.0f}% of {info['n_grid']:,} grid fields.",
-              "Encoder results (each against its own development reference): " + ", ".join(
-                  f"{nm} {enc[e]:.0f}th ({bands_e[e]})" for e, nm in (("midnight", "Midnight"), ("uni2h", "UNI2-h"), ("phikon2", "Phikon-v2"))) +
-              (". All three fall in the same band." if agree else ". They do not all fall in the same band."),
-              f"The case percentile is about {dist:.0f} points from the {near}th-percentile band boundary.",
-              "Encoder agreement and boundary distance describe consistency within this model; they are not a calibrated confidence estimate."]
-        bx.text(0.015, 0.93, "Sampling, image QC and model agreement", size=9, weight="bold", color=INK, transform=bx.transAxes, va="top")
-        yy = 0.80
-        for s in qc:
-            t = W_(s, 118); bx.text(0.015, yy, t, size=7.6, color=INK if not s.startswith("Encoder agreement") else MUTED, va="top", transform=bx.transAxes)
-            yy -= 0.13 * (t.count("\n") + 1) * (0.18 / max(y - 0.055, 0.1))
-        pdf.savefig(f); plt.close(f)
-
-        # ---------------- page 2: field review cards
-        f = plt.figure(figsize=(8.27, 11.69))
-        frame(f, "Inspect the fields selected first by sequential knockout", 2,
-              W_("Cards are in sequential-knockout order, which recomputes every effect after each removal. The score change on each card is "
-                 "for excluding that field alone from the complete input. Left: 448 µm context with the field outlined; right: the 112 µm "
-                 "field as the model read it. Coordinates are in mm from the top-left corner of the scanned image.", 118))
-        for k, fd in enumerate(d["up"]):
-            r_, c_ = divmod(k, 2); x0 = 0.06 + c_ * 0.46; sq = 0.2 * 8.27 / 11.69; yb = 0.715 - r_ * 0.272
+            marks(a_, d["up"], RED, [str(k + 1) for k in range(len(d["up"]))], ms=5)
+        y -= hgt + 0.008
+        if up6 is not None:
+            y = text(f, 0.06, y, f"Removing these six regions together would move the result from the {Pd} to the {po(up6)} percentile; "
+                     + (f"removing the top {top[1][0] * 100:.0f}% of fields in this order ({top[1][1]:,} fields) would move it to the "
+                        f"{po(top[1][2])} ({band_of(top[1][2])} band)." if len(top) > 1 else ""), size=7.4, w=0.88) - 0.006
+        WORD = lambda v: "high for this slide" if v >= 75 else "low for this slide" if v <= 25 else "typical for this slide"
+        NICE = {"estimated nuclear density": "nuclear density", "estimated nuclear size": "nuclear size",
+                "nuclear staining (haematoxylin)": "chromatin", "estimated nuclear crowding": "crowding"}
+        ch = (y - 0.045) / 3
+        for k, fd in enumerate(d["up"][:6]):
+            r_, c_ = divmod(k, 2); x0 = 0.06 + c_ * 0.45; yt = y - r_ * ch
+            rbox(f, x0, yt - ch + 0.008, 0.43, ch - 0.008)
+            f.add_artist(Rectangle((x0, yt - 0.020), 0.43, 0.020, transform=f.transFigure, fc=HEAD, ec="none", zorder=-1))
+            f.text(x0 + 0.010, yt - 0.010, f"REGION {k + 1}", size=7.8, weight="bold", color=RED, va="center")
+            f.text(x0 + 0.42, yt - 0.010, f"x {fd['mm'][0]:.1f} mm   y {fd['mm'][1]:.1f} mm", size=6.8, color=MUTED, va="center", ha="right")
+            sq = 0.205; sh = min(sq * 8.27 / 11.69, ch - 0.074); sq = sh * 11.69 / 8.27; iy = yt - 0.024 - sh
             ctx, fld = crops["up"][k]
-            a = f.add_axes([x0, yb, 0.2, sq]); a.imshow(ctx); a.axis("off"); h, w_ = ctx.shape[:2]
-            a.add_patch(plt.Rectangle((w_ * 0.375, h * 0.375), w_ * 0.25, h * 0.25, fill=False, ec=RED, lw=1.1))
-            px100 = w_ / 448 * 100; a.plot([w_ * 0.05, w_ * 0.05 + px100], [h * 0.93, h * 0.93], color="k", lw=2); a.text(w_ * 0.05, h * 0.89, "100 µm", size=5.5)
-            b = f.add_axes([x0 + 0.21, yb, 0.2, sq]); b.imshow(fld); b.axis("off")
-            f.text(x0, yb + sq + 0.006, f"Field {k + 1}   x {fd['mm'][0]:.1f} mm, y {fd['mm'][1]:.1f} mm", size=8.3, weight="bold", color=RED)
-            yy = para(f, x0, yb - 0.006, f"Computed model response: excluding this field alone changes the score by {fd['chg']:+.3f} SD.", size=7.1, n=60)
-            if fd["desc"]:
-                yy = para(f, x0, yy - 0.002, "Automated image estimate: " + fd["desc"] + ".", size=6.9, n=62, color=MUTED, lh=0.0118)
-            para(f, x0, yy - 0.002, "Review: confirm tissue identity and assess artefact.", size=6.9, n=62, color=ACC, lh=0.0118)
+            a = f.add_axes([x0 + 0.008, iy, sq, sh]); a.imshow(ctx); a.axis("off"); h_, w_ = ctx.shape[:2]
+            a.add_patch(plt.Rectangle((w_ * 0.375, h_ * 0.375), w_ * 0.25, h_ * 0.25, fill=False, ec=RED, lw=1.1))
+            px100 = w_ / 448 * 100; a.plot([w_ * 0.05, w_ * 0.05 + px100], [h_ * 0.93, h_ * 0.93], color="k", lw=2); a.text(w_ * 0.05, h_ * 0.88, "100 µm", size=5.3)
+            b = f.add_axes([x0 + 0.43 - 0.008 - sq, iy, sq, sh]); b.imshow(fld); b.axis("off")
+            lab = COMP_LABEL[fd["comp"]] if fd.get("comp") is not None else "not available"
+            nuc_w = [f"{NICE.get(nm, nm)} {WORD(v).replace(' for this slide', '')}" for nm, v in
+                     sorted((fd.get("nuc") or {}).items(), key=lambda t: -abs(t[1] - 50)) if abs(v - 50) >= 25][:3]
+            est = f"Automated estimate: {lab.lower()}" + (f"; {', '.join(nuc_w)} for this slide" if nuc_w else "") + "."
+            ty = text(f, x0 + 0.010, iy - 0.004, est, size=6.5, w=0.41, color=MUTED, lh=1.2)
+            cy = ty - 0.008; xx = x0 + 0.010
+            f.text(xx, cy, "Review:", size=6.6, color=INK, va="center", weight="bold"); xx += 0.060
+            for lab_ in ("Carcinoma", "Benign", "Stroma/other", "Artefact"):
+                xx = checkbox(f, xx, cy, lab_, 6.4) - 0.008
         pdf.savefig(f); plt.close(f)
 
-        # ---------------- page 3: exclusion tests
+        # ============================================================ page 3: findings in detail
         f = plt.figure(figsize=(8.27, 11.69))
-        frame(f, "How the score changes when selected fields are excluded", 3,
-              "Score change = score after exclusion minus original score, in development-reference SD. Negative values mean a lower model score.")
-        y = 0.915
-        if d.get("comp_rows"):
-            f.text(0.07, y, "Excluding each estimated tissue compartment", size=10, weight="bold", color=INK); y -= 0.02
-            rows = d["comp_rows"]; ax = f.add_axes([0.32, y - 0.035 * len(rows), 0.55, 0.035 * len(rows) - 0.005])
-            vals = [r[3] for r in rows]; ax.barh(range(len(rows)), vals, color=[RED if v < 0 else BLUE for v in vals], height=0.55)
-            ax.axvline(0, color=INK, lw=0.6); ax.set_yticks(range(len(rows)))
-            ax.set_yticklabels([f"{r[0]}  ({r[1]:,} fields, {r[2]:.0f}%)" for r in rows], size=7.2); ax.invert_yaxis()
-            m_ = max(0.1, max(abs(v) for v in vals)) * 1.25; ax.set_xlim(-m_, m_); ax.tick_params(labelsize=6.5)
-            for i_, v in enumerate(vals):
-                ax.text(v + (0.02 * m_ if v >= 0 else -0.02 * m_), i_, f"{v:+.2f}", va="center", ha="left" if v >= 0 else "right", size=6.8, color=INK)
-            for s_ in ("top", "right"):
-                ax.spines[s_].set_visible(False)
-            y -= 0.035 * len(rows) + 0.015
-            y = para(f, 0.07, y, "Each test excludes one group of sampled fields and recomputes the score, so the model's attention over the remaining "
-                     "fields changes. The effects overlap and are not shares of the score. Compartments are automated estimates; in a separate "
-                     "reviewed development sample (40 fields), 93% of fields in the epithelium-enriched cluster were epithelium and 65% carcinoma, "
-                     "which describes that sample, not the chance that a field here is carcinoma.", size=7.6, n=118, color=MUTED) - 0.02
-        f.text(0.07, y, "Nuclear density within epithelium-enriched fields", size=10, weight="bold", color=INK); y -= 0.02
-        dn_ = d.get("dens", {})
+        y = header(f, "Morphology findings in detail", 3,
+                   "Top: what the result rests on. Each row removes one group of the fields the model read and recomputes the result exactly; "
+                   "the dot is this slide's result and the arrow shows where it would move. Groups overlap, so the moves do not add up.")
+        scen = [(f"Without {k_.lower()} ({v[0]:,} fields, {v[1]:.0f}%)", v[2]) for k_, v in comp_after.items()]
         if "hi" in dn_:
-            ax = f.add_axes([0.10, y - 0.13, 0.30, 0.12])
-            ax.bar([0, 1], [dn_["hi"], dn_["lo"]], color=[RED, "#9a96a8"], width=0.6); ax.axhline(0, color=INK, lw=0.6)
-            ax.set_xticks([0, 1]); ax.set_xticklabels([f"densest {dn_['k']:,}", f"least dense {dn_['k']:,}"], size=6.8)
-            ax.set_ylabel("score change (SD)", size=6.8); ax.tick_params(labelsize=6.3)
-            for i_, v in enumerate([dn_["hi"], dn_["lo"]]):
-                ax.text(i_, v, f"{v:+.2f}", ha="center", va="bottom" if v >= 0 else "top", size=6.8)
-            for s_ in ("top", "right"):
-                ax.spines[s_].set_visible(False)
-            diff = dn_["lo"] - dn_["hi"]
-            ax2 = f.add_axes([0.52, y - 0.13, 0.38, 0.12]); bins = np.asarray(REF["dens_bins"]); ctr = (bins[1:] + bins[:-1]) / 2
-            for ds, col, nm in (("owl", "#7a8fb5", "Radboudumc"), ("tcga", "#c08a3e", "TCGA")):
-                hh = np.asarray(REF["dens_hist"][ds], float); ax2.plot(ctr, hh / hh.sum(), color=col, lw=1.3, label=nm)
-            ax2.axvline(diff, color=INK, lw=1.6); ax2.text(diff, ax2.get_ylim()[1] * 0.95, " this case", size=6.6, va="top")
-            ax2.set_xlabel("difference between the two tests (SD)", size=6.8); ax2.set_yticks([]); ax2.tick_params(labelsize=6.3)
-            ax2.legend(frameon=False, fontsize=6.3); [ax2.spines[s_].set_visible(False) for s_ in ("top", "right", "left")]
-            ax2.set_title("development patients with enough of this tissue", size=6.8)
-            y -= 0.16
-            y = para(f, 0.07, y, f"Of {dn_['n']:,} epithelium-enriched fields, excluding the {dn_['k']:,} with the highest estimated nuclear density "
-                     f"(about {dn_['d_hi']:,.0f} nuclei per mm²) changes the score by {dn_['hi']:+.2f} SD; excluding the {dn_['k']:,} with the lowest "
-                     f"(about {dn_['d_lo']:,.0f} per mm²) changes it by {dn_['lo']:+.2f} SD, a difference of {diff:.2f} SD. In development patients "
-                     "eligible for this analysis (371 Radboudumc, 280 TCGA), excluding the densest quarter lowered the score more than excluding the "
-                     "least dense quarter in 98% and 96%; the mean differences were 0.22 and 0.18 SD. The two groups also differ in features other "
-                     "than density, so this test shows what the score is sensitive to, not a cause. Prior nuclear-morphometry research gives biological "
-                     "context [8]; it does not validate this measurement or case.", size=7.9, n=116) - 0.02
-        else:
-            y = para(f, 0.07, y, f"Not computed: only {dn_.get('n', 0)} epithelium-enriched fields were analysed (at least 40 are needed).") - 0.02
-        f.text(0.07, y, "Fields whose exclusion raises the score most", size=10, weight="bold", color=BLUE); y -= 0.015
-        for k, fd in enumerate(d["dn"]):
-            x0 = 0.07 + k * 0.30; ctx, fld = crops["dn"][k]; sq = 0.14 * 8.27 / 11.69
-            b = f.add_axes([x0, y - sq - 0.018, 0.14, sq]); b.imshow(fld); b.axis("off")
-            f.text(x0, y - 0.012, f"{'abc'[k]}   x {fd['mm'][0]:.1f}, y {fd['mm'][1]:.1f} mm", size=7.6, weight="bold", color=BLUE)
-            yy = para(f, x0, y - sq - 0.024, f"Excluding it changes the score by {fd['chg']:+.3f} SD.", size=6.9, n=38)
-            if fd["desc"]:
-                para(f, x0, yy - 0.002, "Automated estimate: " + fd["desc"] + ".", size=6.6, n=40, color=MUTED, lh=0.0112)
-        if d["up"] and d["dn"] and max(abs(x["chg"]) for x in d["dn"]) < 0.5 * max(abs(x["chg"]) for x in d["up"]):
-            f.text(0.07, 0.06, "These single-field effects are much smaller than those of the fields on page 2.", size=7.4, color=MUTED)
+            scen += [(f"Without the densest quarter of gland fields ({dn_['k']:,})", after(dn_["hi"])),
+                     (f"Without the least dense quarter of gland fields ({dn_['k']:,})", after(dn_["lo"]))]
+        scen += [(f"Without the top {fr * 100:.0f}% of fields in removal order ({k_:,})", pa) for fr, k_, pa in top]
+        hh = 0.026 * len(scen) + 0.03
+        ax = f.add_axes([0.42, y - hh, 0.50, hh]); ax.set_xlim(0, 100); ax.set_ylim(len(scen) - 0.4, -0.9)
+        for lo_, hi_, b in ((0, 50, "low"), (50, 80, "medium"), (80, 100, "high")):
+            ax.axvspan(lo_, hi_, color=BAND_C[b], alpha=0.09, lw=0); ax.text((lo_ + hi_) / 2, -0.62, b.capitalize(), ha="center", size=6.8, color=BAND_C[b])
+        for i_, (lab, pa) in enumerate(scen):
+            if abs(pa - P) >= 0.6:
+                ax.annotate("", xy=(pa, i_), xytext=(P, i_), arrowprops=dict(arrowstyle="-|>", color=INK, lw=1.0, shrinkA=3, shrinkB=0))
+            ax.plot(P, i_, "o", color=BAND_C[band], ms=5.5, zorder=3)
+            ax.text(pa + (1.6 if pa >= P else -1.6), i_ - 0.25, po(pa), size=6.5, ha="left" if pa >= P else "right", color=INK)
+        ax.set_yticks(range(len(scen))); ax.set_yticklabels([s[0] for s in scen], size=6.9); ax.tick_params(axis="y", length=0)
+        ax.set_xticks([0, 50, 80, 100]); ax.set_xticklabels(["0", "50th", "80th", "100th"], size=6.5)
+        ax.set_xlabel("percentile of the development cohort", size=6.8); [ax.spines[s_].set_visible(False) for s_ in ("top", "right", "left")]
+        y -= hh + 0.045
+        # reference ranges in detail
+        rows = [r for r in FIND if r[2] is not None]
+        y = section(f, 0.06, y, 0.88, 0.032 + 0.030 * len(rows) + 0.02, "This slide against the development cohort")
+        for lab, val, pr, eff, nm in rows:
+            q = BIO[nm]["q"]
+            f.text(0.075, y, lab, size=7.2, color=INK, va="top"); f.text(0.34, y, val, size=7.2, color=INK, va="top")
+            refbar(f, 0.47, y - 0.005, 0.30, nm, bio[nm], h=0.012)
+            unit = "%" if nm.endswith("share") else ""
+            fmt = (lambda t: f"{100 * t:.0f}%") if nm.endswith("share") else (lambda t: f"{t:,.0f}" if t > 100 else f"{t:.2f}" if t < 10 else f"{t:.1f}")
+            f.text(0.47, y - 0.016, f"10th {fmt(q[10])}   median {fmt(q[50])}   90th {fmt(q[90])}", size=5.8, color=MUTED, va="top")
+            f.text(0.79, y, f"{po(pr)} percentile", size=7.0, color=INK, va="top")
+            y -= 0.030
+        text(f, 0.075, y - 0.002, "Reference: the same automated measures on 806 development slides (nuclear measures within gland epithelium, "
+             "slides with at least 40 such fields). Estimated by linear read-outs from the image model (cross-validated on development slides: "
+             "tissue group accuracy 0.92; nuclear density R² 0.94, size 0.86, chromatin 0.93, crowding 0.90).", size=6.3, w=0.85, color=MUTED, lh=1.2)
+        y -= 0.06
+        f.text(0.06, y, "Regions that lower the result most", size=9, weight="bold", color=BLUE, va="top"); y -= 0.017
+        y = text(f, 0.06, y, "Removing one of these on its own raises the result the most; they are shown so that the evidence on both sides "
+                 "can be checked.", size=7.1, w=0.88, color=MUTED) - 0.004
+        sq = 0.15; sh = sq * 8.27 / 11.69
+        for k, fd in enumerate(d["dn"][:3]):
+            x0 = 0.06 + k * 0.30; ctx, fld = crops["dn"][k]
+            a = f.add_axes([x0, y - sh, sq, sh]); a.imshow(fld); a.axis("off")
+            f.text(x0, y - sh - 0.008, f"{'abc'[k]}   x {fd['mm'][0]:.1f}, y {fd['mm'][1]:.1f} mm", size=7, weight="bold", color=BLUE, va="top")
+            lab = COMP_LABEL[fd["comp"]].lower() if fd.get("comp") is not None else ""
+            f.text(x0, y - sh - 0.021, f"Automated estimate: {lab}", size=6.5, color=MUTED, va="top")
         pdf.savefig(f); plt.close(f)
 
-        # ---------------- page 4: development outcomes by band
+        # ============================================================ page 4: outcomes by band
         f = plt.figure(figsize=(8.27, 11.69))
-        frame(f, "Observed outcomes in the development cohorts", 4,
-              W_("Biochemical-recurrence-free curves (Kaplan-Meier, 95% confidence bands) for development patients grouped by band using out-of-fold "
-                 "scores, that is, each patient scored by models that did not train on that patient. Band cut-offs are fixed percentiles, not tuned "
-                 f"to outcomes. This case's band ({band}) is drawn heavier.", 118))
-        for j_, (ds, nm, fu) in enumerate((("owl", "Radboudumc", "508 patients, 87 events, median follow-up 5.1 years"),
-                                            ("tcga", "TCGA-PRAD", "298 patients, 62 events, median follow-up 2.1 years"))):
-            K = REF["km"][ds]; g_ = np.asarray(K["grid"]); y_top = 0.88 - j_ * 0.41
-            ax = f.add_axes([0.12, y_top - 0.27, 0.80, 0.26])
+        y = header(f, "Clinical validity in the development cohorts", 4,
+                   "Each development patient was scored by models that had not seen that patient (out-of-fold) and grouped by band. "
+                   f"Curves show the share free of biochemical recurrence, with 95% bands; this slide's band ({band}) is drawn heavier.")
+        y_tab = y; y = section(f, 0.06, y, 0.88, 0.112, "Outcome by band")
+        tab = [("Band", "Radboudumc patients", "Recurrence by 5 years", "TCGA-PRAD patients", "Recurrence by 3 years")]
+        for b in ("low", "medium", "high"):
+            tab.append((b.capitalize(), f"{km['bands'][b]['n']}", f"{bcr5[b]:.0f}%", f"{kmt['bands'][b]['n']}", f"{bcr3t[b]:.0f}%"))
+        xs = [0.08, 0.22, 0.41, 0.60, 0.77]
+        for i_, row in enumerate(tab):
+            for j_, cell in enumerate(row):
+                f.text(xs[j_], y - i_ * 0.0145, cell, size=7.4 if i_ else 6.8, va="top",
+                       color=(BAND_C[row[0].lower()] if (j_ == 0 and i_) else MUTED if not i_ else INK),
+                       weight="bold" if (i_ and row[0].lower() == band) else "normal")
+        y -= 0.0145 * len(tab)
+        text(f, 0.08, y, "Ranking accuracy (Harrell's C, out-of-fold): 0.71 at Radboudumc and 0.70 in TCGA-PRAD (0.5 is chance, 1 is perfect).",
+             size=7.1, w=0.84)
+        y0 = y_tab - 0.112 - 0.035
+        for j_, (ds, nm, fu) in enumerate((("owl", "Radboudumc", "508 patients, 87 recurrences, median follow-up 5.1 years"),
+                                            ("tcga", "TCGA-PRAD", "298 patients, 62 recurrences, median follow-up 2.1 years"))):
+            Kd = REF["km"][ds]; gg = np.asarray(Kd["grid"]); y_top = y0 - j_ * 0.335
+            ax = f.add_axes([0.12, y_top - 0.235, 0.80, 0.225])
             for b in ("low", "medium", "high"):
-                B = K["bands"][b]; lw = 2.4 if b == band else 1.2
-                ax.step(g_, B["s"], where="post", color=BANDC[b], lw=lw, label=f"{b} ({B['n']} patients, {B['events']} events)")
-                ax.fill_between(g_, B["lo"], B["hi"], step="post", color=BANDC[b], alpha=0.12 if b == band else 0.06, lw=0)
-            ax.set_ylim(0, 1.02); ax.set_xlim(0, K["tmax"]); ax.set_ylabel("recurrence-free", size=7.5); ax.set_xlabel("years of follow-up", size=7.5)
-            ax.grid(True, color=GRID, lw=0.5); ax.tick_params(labelsize=7); ax.legend(frameon=False, fontsize=7, loc="lower left")
-            [ax.spines[s_].set_visible(False) for s_ in ("top", "right")]
-            ax.set_title(f"{nm}: {fu}", size=8.5, loc="left", color=INK)
-            ty = y_top - 0.30
-            f.text(0.03, ty, "At risk", size=6.8, color=MUTED, weight="bold")
+                B = Kd["bands"][b]; lw = 2.6 if b == band else 1.2
+                ax.step(gg, B["s"], where="post", color=BAND_C[b], lw=lw, label=f"{b} ({B['n']} patients, {B['events']} recurrences)")
+                ax.fill_between(gg, B["lo"], B["hi"], step="post", color=BAND_C[b], alpha=0.12 if b == band else 0.05, lw=0)
+            ax.set_ylim(0, 1.02); ax.set_xlim(0, Kd["tmax"]); ax.set_ylabel("free of recurrence", size=7.3); ax.set_xlabel("years after surgery", size=7.3)
+            ax.grid(True, color=HEAD, lw=0.6); ax.tick_params(labelsize=6.8); ax.legend(frameon=False, fontsize=6.8, loc="lower left")
+            [ax.spines[s_].set_visible(False) for s_ in ("top", "right")]; ax.set_title(f"{nm}: {fu}", size=8, loc="left", color=INK)
+            ty = y_top - 0.262; f.text(0.03, ty, "At risk", size=6.4, color=MUTED, weight="bold")
             for b_i, b in enumerate(("low", "medium", "high")):
-                f.text(0.03, ty - 0.013 * (b_i + 1), b, size=6.6, color=BANDC[b])
-                for tk, nr in zip(K["ticks"], K["bands"][b]["at_risk"]):
-                    f.text(0.12 + 0.80 * tk / K["tmax"], ty - 0.013 * (b_i + 1), str(nr), size=6.6, ha="center", color=INK)
-        para(f, 0.07, 0.085, "These curves describe what happened to development patients in each band. They are not this patient's predicted "
-             "recurrence-free probability, and band separation in development data does not establish performance in new patients or centres. "
-             "Recurrence events and follow-up are as defined and curated by the challenge organisers; curves stop where fewer than 10 patients "
-             "in any band remain at risk.", size=7.5, n=120, color=MUTED)
+                f.text(0.03, ty - 0.0115 * (b_i + 1), b, size=6.2, color=BAND_C[b])
+                for tk, nr in zip(Kd["ticks"], Kd["bands"][b]["at_risk"]):
+                    f.text(0.12 + 0.80 * tk / Kd["tmax"], ty - 0.0115 * (b_i + 1), str(nr), size=6.2, ha="center", color=INK)
+        text(f, 0.06, 0.072, "These figures describe development patients; they are not this patient's predicted probability, and results at "
+             "new centres may differ. Recurrence events and follow-up are as curated by the challenge organisers.", size=6.8, w=0.88, color=MUTED)
         pdf.savefig(f); plt.close(f)
 
-        # ---------------- page 5: how it was produced, how to question it
+        # ============================================================ page 5: methods
         f = plt.figure(figsize=(8.27, 11.69))
-        frame(f, "How this result was produced, and how to question it", 5)
-        blocks = [("Workflow",
-                   "H&E slide → 112 µm fields sampled on a fixed grid inside the tissue mask → three frozen pathology foundation models "
-                   "(Midnight-12K, UNI2-h, Phikon-v2) [4-6] → attention-based multiple-instance models [1] trained on recurrence outcomes with the "
-                   "Cox partial likelihood [2] → risk score (mean of the three encoders' standardised scores, 15 models in all) → percentile in the "
-                   "development reference → exclusion tests. Inputs are H&E image fields only; training targets were recurrence outcomes."),
-                  ("What an exclusion test computes",
-                   "Each model scores a slide as an attention-weighted sum of field values. Excluding fields renormalises the attention of the rest, "
-                   "and the new score is computed exactly for the fixed model and field representations. Exact computation does not establish that "
-                   "tissue labels, outcome predictions or biological interpretations are correct."),
-                  ("Automated image estimates",
-                   "Tissue compartments and nuclear measurements are predicted from the Midnight field representation by linear read-outs trained on "
-                   "202 development slides and validated with 5-fold cross-validation grouped by slide: compartment accuracy 0.92; variance explained "
-                   "0.94 for nuclear density, 0.86 for nuclear size, 0.93 for nuclear staining and 0.90 for crowding. Reference nuclei came from a "
-                   "network trained to reproduce Cellpose-SAM [7], whose counts correlated with Cellpose-SAM at r = 0.97 on 100 reviewed fields."),
-                  ("Development performance",
-                   "Ranking quality, out-of-fold, by Harrell's C [3]: 0.71 (95% CI 0.64 to 0.77) at Radboudumc and 0.70 (0.64 to 0.77) in TCGA. "
-                   "C is the share of comparable patient pairs ranked correctly, not an accuracy. Results on the challenge's hidden test centres are "
-                   "pending; scanner, stain and site differences can shift deep models [9]."),
-                  ("Review checklist",
-                   "1. Confirm sampled-tissue coverage on page 1.  2. Inspect field 1 and the other selected fields for tissue identity and artefact.  "
-                   "3. Check whether the automated labels and nuclear measurements fit the images.  4. Inspect the contrasting fields and any "
-                   "encoder disagreement.  5. Record any discrepancy before interpreting the result. Inspecting selected fields cannot establish that "
-                   "all analysed tissue is free of artefact.")]
-        y = 0.92
+        y = header(f, "Methods, quality definitions and limitations", 5)
+        y = section(f, 0.06, y, 0.88, 0.098, "Workflow")
+        steps = ["H&E slide and\ntissue mask", "112 µm fields on\na fixed grid", "Three pathology\nimage models", "Recurrence model\ntrained on outcomes",
+                 "Percentile, band\nand evidence regions"]
+        bw = 0.152; gap = (0.84 - 5 * bw) / 4
+        for i_, s in enumerate(steps):
+            x0 = 0.08 + i_ * (bw + gap); rbox(f, x0, y - 0.05, bw, 0.044, fc=PANEL)
+            f.text(x0 + bw / 2, y - 0.028, s, size=6.8, ha="center", va="center", color=INK)
+            if i_ < 4:
+                f.add_artist(FancyArrowPatch((x0 + bw + 0.002, y - 0.028), (x0 + bw + gap - 0.002, y - 0.028), transform=f.transFigure,
+                                             arrowstyle="-|>", mutation_scale=8, color=MUTED, lw=0.9))
+        y -= 0.075
+        blocks = [("Intended use", "A research adjunct to routine reporting of radical prostatectomy specimens. It ranks the slide's "
+                   "recurrence risk against development patients and shows the tissue the ranking depends on, for the pathologist to verify. "
+                   "It does not replace grading, staging or margin assessment and is not for treatment decisions."),
+                  ("Input and training", "Only the H&E image inside the tissue mask. The models were trained on time to biochemical recurrence "
+                   "in 806 development patients (Radboudumc and TCGA-PRAD). Gleason grade, ISUP group, stage, margins and PSA were not used as "
+                   "inputs, targets or intermediate steps."),
+                  ("Model and evidence regions", "Frozen image models (Midnight-12K, UNI2-h, Phikon-v2) [4-6] describe each field; "
+                   "attention-based multiple-instance models [1] trained with the Cox partial likelihood [2] combine the fields into one "
+                   f"score ({ensemble}). The score is an attention-weighted average of field values, so removing fields re-weights the rest "
+                   "and the new score is computed exactly. Evidence regions are ordered by sequential removal."),
+                  ("Morphology findings", "Tissue groups and nuclear measures are estimated from the image model by linear read-outs trained on "
+                   "202 development slides against nuclei segmented with a network distilled from Cellpose-SAM [7] (counts r = 0.97 on 100 "
+                   "reviewed fields). They describe the tissue the model read; the model itself does not use them."),
+                  ("Quality metrics", "Tissue read: adequate at 500 fields or more, limited at 100 to 499. Gland-epithelium fields: at least 40 "
+                   "for the density finding. Agreement: whether the three image models, each scored alone, fall in the same band. Borderline: "
+                   "within 5 percentile points of a band cut-off. Thresholds are provisional."),
+                  ("Limitations", "Development-stage test. Results at the challenge's external test centres are not yet available; scanner, "
+                   "stain and site differences can shift deep models [9]. Six regions cannot show that all analysed tissue is free of artefact. "
+                   "Morphology findings are estimates and are shown for review, not as measurements for reporting.")]
         for h, s in blocks:
-            f.text(0.07, y, h, size=9.8, weight="bold", color=INK); y = para(f, 0.07, y - 0.018, s, size=8.1, n=116) - 0.016
-        f.text(0.07, y, "References", size=9.8, weight="bold", color=INK); y -= 0.018
+            f.text(0.06, y, h, size=8.4, weight="bold", color=NAVY, va="top"); y = text(f, 0.06, y - 0.015, s, size=7.5, w=0.88) - 0.008
+        f.text(0.06, y, "References", size=8.4, weight="bold", color=NAVY, va="top"); y -= 0.016
         for k, r in enumerate(REFS):
-            y = para(f, 0.07, y, f"{k + 1}. {r}", size=6.9, n=128, lh=0.0108) - 0.003
+            y = text(f, 0.06, y, f"{k + 1}. {r}", size=6.3, w=0.88, lh=1.22) - 0.0005
         pdf.savefig(f); plt.close(f)
 
 
 # ------------------------------------------------------------------ main
-def run(model):
+def get_args_parser():
+    """Arguments for run(args), as the organisers' faithfulness notebook calls it (one slide and one mask per call)."""
+    import argparse
+    p = argparse.ArgumentParser("KNOX inference", add_help=False)
+    p.add_argument("--input", default=str(INPUT_PATH), help="folder holding images/prostatectomy-wsi and images/prostatectomy-tissue-mask")
+    p.add_argument("--output", default=str(OUTPUT_PATH), help="folder for overall-survival-years.json and the other outputs")
+    p.add_argument("--wsi-dir", default=None, help="slide folder (default: <input>/images/prostatectomy-wsi)")
+    p.add_argument("--mask-dir", default=None, help="mask folder (default: <input>/images/prostatectomy-tissue-mask)")
+    p.add_argument("--no-report", action="store_true", help="skip the PDF report; the prediction and the map are unchanged")
+    return p
+
+
+def run(model=None):
+    """Grand Challenge: run(model) with model = init_model(), inputs under /input (inputs.json lists the sockets).
+    Faithfulness notebook: run(args) with args from get_args_parser(); the model is loaded on each call and no
+    inputs.json is needed. The prediction is written to <output>/overall-survival-years.json in both cases."""
+    import argparse
+    global INPUT_PATH, OUTPUT_PATH, REPORT
+    if model is None or isinstance(model, argparse.Namespace):
+        args = model if model is not None else get_args_parser().parse_args([])
+        INPUT_PATH, OUTPUT_PATH, REPORT = Path(args.input), Path(args.output), not args.no_report
+        DIRS.clear()
+        if args.wsi_dir:
+            DIRS["images/prostatectomy-wsi"] = Path(args.wsi_dir)
+        if args.mask_dir:
+            DIRS["images/prostatectomy-tissue-mask"] = Path(args.mask_dir)
+        M = init_model()
+        try:
+            return handle(M)
+        finally:
+            del M
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     keyset = tuple(sorted(sv["socket"]["slug"] for sv in json.load(open(INPUT_PATH / "inputs.json"))))
     assert keyset == ("prostatectomy-tissue-mask", "prostatectomy-tissue-whole-slide-image"), keyset
     return handle(model)
 
 
 def find(d):
-    fs = sorted(sum((glob.glob(str(INPUT_PATH / d / f"*.{e}")) for e in ("tif", "tiff", "mha")), []))
+    base = DIRS.get(d) or INPUT_PATH / d
+    fs = sorted(sum((glob.glob(str(Path(base) / f"*.{e}")) for e in ("tif", "tiff", "mha")), []))
     assert fs, f"no input in {d}"; return fs[0]
 
 
 def handle(M):
     import openslide
     t0 = time.time(); wsi, mpath = find("images/prostatectomy-wsi"), find("images/prostatectomy-tissue-mask")
-    sl = openslide.OpenSlide(wsi); W, H = sl.level_dimensions[0]; mpp0 = slide_mpp(sl, wsi)
-    mask = read_mask(mpath); mscale = W / mask.shape[1]; mspacing = mpp0 * mscale
-    s20 = int(round(TILE_PX * MPP20 / mpp0))
+    sl = openslide.OpenSlide(wsi); W, H = sl.level_dimensions[0]
+    mask, mask_sp = read_mask(mpath); mscale = W / mask.shape[1]
+    if abs((H / mask.shape[0]) / mscale - 1) > 0.01:
+        log(f"WARNING: slide-to-mask scale differs by axis ({mscale:.3f} in x, {H / mask.shape[0]:.3f} in y)")
+    mpp0 = slide_mpp(sl, wsi, mask_sp, mscale)
+    mspacing = mask_sp if (mask_sp and 0.5 <= mask_sp <= 100) else mpp0 * mscale       # the map takes the mask's spacing
+    s20 = max(1, int(round(TILE_PX * MPP20 / mpp0)))
     all_xy = grid(W, H, s20, mask, mscale); xy = cap(all_xy, W, H, s20)
     log(f"slide {W}x{H} mpp {mpp0:.4f}; mask {mask.shape} ({mspacing:.2f} um/px); tiles {len(all_xy)} -> {len(xy)}")
-    if len(xy) == 0:                                    # empty mask: fall back to the whole slide
-        mask = np.ones_like(mask); all_xy = grid(W, H, s20, mask, mscale); xy = cap(all_xy, W, H, s20)
-    X, ok = embed(M, wsi, xy, s20); xy = xy[ok]
+    if len(xy) == 0:                                    # empty mask (e.g. every field removed): nothing to read
+        return write_empty(M, mask, mspacing, sl, t0)
+    X, ok = embed(M, wsi, xy, s20)
+    if X is None:
+        return write_empty(M, mask, mspacing, sl, t0, note="No field could be read from the slide image, so the development median is reported.")
+    xy = xy[ok]
     tissue = tissue_keep(M, X)
     sel = select_lattice(tissue, xy, s20, lattice_k(W, H, s20)) if SELECT == "lattice" else select(tissue)
-    if len(sel) < 16:                                   # tiny tissue: fall back to the list rule
+    if len(sel) < 16 and tissue.sum() < 80:             # tiny tissue (the lattice cannot hold 16 fields): list rule
         sel = select(tissue)
+    if len(sel) == 0:                                   # every read field removed by a mask edit: nothing left to read
+        return write_empty(M, mask, mspacing, sl, t0, note="No analysed field remained inside the tissue mask, so the "
+                           "development median is reported.")
     log(f"Midnight embedded {len(xy)} tiles; tissue {tissue.sum()}; analysed {len(sel)}")
-    F2, ok2 = embed(M, wsi, xy[sel], s20, fn=f_second); sel = sel[ok2]
+    F2, ok2 = embed(M, wsi, xy[sel], s20, fn=f_second)
+    if F2 is None:
+        return write_empty(M, mask, mspacing, sl, t0, note="No analysed field could be read again, so the development median is reported.")
+    sel = sel[ok2]
     F = dict(midnight=X[sel].half().float(), **F2)
     log(f"UNI2-h + Phikon-v2 embedded {len(sel)} tiles")
     z, c_single, per, (A_, V_, w_) = score_v2(M, F)
+    if not np.isfinite(z):                              # never write a non-finite prediction
+        log(f"WARNING: non-finite score ({z}); reporting the development median")
+        return write_empty(M, mask, mspacing, sl, t0, note="The score could not be computed, so the development median is reported.")
     c, order = sequential_effects(A_, V_, w_)
     log(f"sequential knockout: {int((c > 0).sum())} of {len(c)} tiles lower the score when removed")
     if os.environ.get("OWL_DEBUG_DUMP"):                # per-tile parts for the mask-edit check (not used in scoring)
@@ -768,24 +1079,28 @@ def handle(M):
           for e in ENCS:
             for k_, (net, mu, sd) in enumerate(M["mils"][e]):
                 att, s_ = net.parts(F[e]); dump[f"{e}_{k_}_a"] = att.float().cpu().numpy(); dump[f"{e}_{k_}_v"] = ((s_ - mu) / sd).float().cpu().numpy()
-        np.savez(OUTPUT_PATH / "debug.npz", **dump)
+        OUTPUT_PATH.mkdir(parents=True, exist_ok=True); np.savez(OUTPUT_PATH / "debug.npz", **dump)
     keep = np.zeros(len(xy), bool); keep[sel] = True
     cal = M["cal"]; kxy = xy[keep]
-    years = float(np.clip(cal["median_followup_y"] * np.exp(-z / max(cal["z_sd"], 1e-6)), 0.1, 50.0))
+    years = float(np.clip(cal["median_followup_y"] * np.exp(-z / max(cal["z_sd"], 1e-6)), 0.01, 50.0))
     group = "low" if z < cal["q50"] else "medium" if z < cal["q80"] else "high"
-    from scipy.stats import norm
     pct = ref_percentile(z)
     log(f"z {z:+.3f} group {group} years {years:.2f}; per encoder " + " ".join(f"{e} {v:+.2f}" for e, v in per.items()))
 
     OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
     json.dump(years, open(OUTPUT_PATH / "overall-survival-years.json", "w"))
     json.dump(group, open(OUTPUT_PATH / "prostate-cancer-risk-classification.json", "w"))
-    heat = paint(heat_rank(order, int((c_single > 0).sum()), xy, sel, tissue, all_xy), all_xy, s20, mscale, mask)
-    heat_view = heat                                     # the report shows the submitted map
+    heat_view = paint(heat_rank(order, int((c_single > 0).sum()), xy, sel, tissue, all_xy), all_xy, s20, mscale, mask)
+    tile = faith_patch_px(sl, W, mask.shape[1], mpp0)
+    heat = heat_patches(c, order, kxy, s20, mscale, mask, tile, view=heat_view) if tile else heat_view   # submitted map
+    log(f"attribution map on the faithfulness grid ({tile} mask px patches)" if tile else "attribution map: grid fallback (no whole-number patch size)")
     if os.environ.get("OWL_DEBUG_DUMP"):
         np.save(OUTPUT_PATH / "heat_view.npy", heat_view)
     write_heatmap(OUTPUT_PATH / "images/prostatectomy-overall-survival-attribution-heatmap/attribution.tif", heat, mspacing)
     log("heatmap written")
+    if not REPORT:                                      # faithfulness runs: the prediction and the map are unchanged
+        sl.close(); log(f"case done in {time.time() - t0:.0f}s (no report)")
+        return 0
     try:
         info = dict(group=group, z=z, pct=pct, mpp0=mpp0, mm2=tissue.sum() * (s20 * mpp0 / 1000) ** 2, case=f"Case {Path(wsi).stem}",
                     n_grid=int(len(xy)), filt=100.0 * (1 - tissue.mean()))
@@ -799,20 +1114,46 @@ def handle(M):
             bg = Image.new("RGB", r.size, (255, 255, 255)); bg.paste(r, mask=r.split()[3]); return np.asarray(bg.resize((336, 336)))
         crops = {k: [(ctx(kxy[fd["i"]]), rd.one(kxy[fd["i"]], s20)) for fd in d[k]] for k in ("up", "dn")}
         f = max(1, max(heat.shape) // 2048)
-        write_report_v4(OUTPUT_PATH / "pathology-report.pdf", sl, info, d, crops, heat_view[::f, ::f])
+        if os.environ.get("OWL_REPORT_DUMP"):              # report inputs for offline layout work (not used in scoring)
+            import pickle
+            pickle.dump(dict(info=info, d=d, crops=crops, heat_small=heat_view[::f, ::f], W0=sl.level_dimensions[0][0],
+                             thumb=np.asarray(sl.get_thumbnail((1400, 1400)).convert("RGB"))), open(os.environ["OWL_REPORT_DUMP"], "wb"))
+        K = dict(REF=REF, REFS=REFS, COMP_LABEL=COMP_LABEL, ordinal=ordinal, ref_percentile=ref_percentile)
+        write_report_v5(OUTPUT_PATH / "pathology-report.pdf", info, d, crops, heat_view[::f, ::f],
+                        np.asarray(sl.get_thumbnail((1400, 1400)).convert("RGB")), sl.level_dimensions[0][0], ENSEMBLE, K)
     except Exception as e:                                # the report must never cost us the prediction
         import traceback; log(f"report failed ({type(e).__name__}: {e}); writing minimal PDF\n" + traceback.format_exc())
         write_min_pdf(OUTPUT_PATH / "pathology-report.pdf", group, pct)
     sl.close()
+    if torch.cuda.is_available():
+        log(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.1f} GB")
     log(f"case done in {time.time() - t0:.0f}s")
     return 0
 
 
-def write_min_pdf(path, group, pct):
+def write_empty(M, mask, mspacing, sl, t0, note="The tissue mask was empty, so no tissue was analysed and the development median is reported."):
+    """No tissue inside the mask: report the development median (the score with no evidence either way), an empty map
+    and a one-page report, so that a fully removed mask gives a fixed baseline instead of a whole-slide reading."""
+    cal = M["cal"]; z = float(cal["q50"]); pct = 50.0
+    years = float(np.clip(cal["median_followup_y"] * np.exp(-z / max(cal["z_sd"], 1e-6)), 0.01, 50.0))
+    group = "low" if z < cal["q50"] else "medium" if z < cal["q80"] else "high"
+    log(f"empty tissue mask: development-median score z {z:+.3f} ({group}), empty map")
+    OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+    json.dump(years, open(OUTPUT_PATH / "overall-survival-years.json", "w"))
+    json.dump(group, open(OUTPUT_PATH / "prostate-cancer-risk-classification.json", "w"))
+    write_heatmap(OUTPUT_PATH / "images/prostatectomy-overall-survival-attribution-heatmap/attribution.tif", np.zeros(mask.shape, np.uint8), mspacing)
+    write_min_pdf(OUTPUT_PATH / "pathology-report.pdf", group, pct, note=note)
+    sl.close(); log(f"case done in {time.time() - t0:.0f}s")
+    return 0
+
+
+def write_min_pdf(path, group, pct, note=""):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     f = plt.figure(figsize=(8.27, 11.69)); f.text(0.1, 0.9, f"Reference band: {group}; reference percentile {pct:.0f}. Research use only.", size=12)
+    if note:
+        f.text(0.1, 0.87, note, size=10)
     f.savefig(path, format="pdf"); plt.close(f)
 
 

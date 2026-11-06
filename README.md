@@ -119,13 +119,26 @@ Outputs per case:
 
 - `/output/overall-survival-years.json`: a ranking time in years, monotone in the negative risk score
 - `/output/prostate-cancer-risk-classification.json`: `low`, `medium` or `high` (training-cohort quantiles of the score)
-- `/output/images/prostatectomy-overall-survival-attribution-heatmap/attribution.tif`: uint8 map on the mask grid
-  ordered by sequential knockout; 128 is neutral, above 128 pushes towards recurrence, 0 is outside the mask
-- `/output/pathology-report.pdf`: two-page report (risk summary, map, fields with the largest contributions)
+- `/output/images/prostatectomy-overall-survival-attribution-heatmap/attribution.tif`: uint8 map on the mask grid,
+  drawn on the patch grid of the organisers' faithfulness test (256 px at 0.5 um/px from the mask origin). Patches
+  that overlap a field removed by sequential knockout carry its rank (255 for the first, down to 130); tissue the model
+  did not read takes 3 to 129 from the rank of its nearest read field, so the map reads as one picture but always sits
+  below every read field (removing unread tissue changes nothing); patches that touch only fields whose removal would
+  raise the score are 1, and outside the mask is 0
+- `/output/pathology-report.pdf`: five-page report (percentile and band, map, the fields the score rests on, compartment
+  and density checks, outcome by band in the development cohorts)
 
 Optional environment variables: `OWL_GPU_MEM_GB` caps GPU memory (the test script sets 16 to emulate a T4),
 `OWL_SELECT=list` uses the training tile rule instead of the lattice, and `OWL_DEBUG_DUMP=1` writes per-tile arrays
 used by `analysis/e32_mask_edit_e2e.py`.
+
+Mask edits only ever remove analysed fields: the fields are a fixed lattice of grid tiles, and a field leaves the bag
+when less than 25% of its window is tissue. If every analysed field has been removed, the development median is
+reported; the training tile rule is used only when the tissue is too small for the lattice to hold 16 fields.
+
+Inputs are read defensively: masks as TIFF (any tiling, bit depth or photometric) or MetaImage, with tissue = 1 where
+the mask uses 1 and any non-zero value otherwise; the slide's pixel size from its resolution tag, openslide or the
+mask's spacing, accepted only between 0.08 and 2 um; a slide region that cannot be read is skipped.
 
 ## Citation
 
@@ -138,3 +151,23 @@ Apache License 2.0. See `LICENSE` and `NOTICE`.
 ## Building on Grand Challenge
 
 The root `Dockerfile` builds the same image as `container/Dockerfile` and is what the Grand Challenge GitHub integration uses: link this repository to the algorithm, and every new tag (or GitHub release) triggers a build. Model weights are not in the repository; upload them separately on the algorithm's Models page as a tarball of the model directory (`container/do_save.sh` creates it). At run time they are available at `/opt/ml/model`.
+
+## Faithfulness evaluation
+
+The organisers' notebook (`faithfulness_blackbox.ipynb` in the OWL challenge repository) calls `inference.py` as a
+black box through `get_args_parser()` and `run(args)`, one slide and one perturbed mask per call. In the image the code
+is at `/opt/app/inference.py` and the model at `/opt/ml/model`. Settings for the notebook's configuration cell:
+
+```python
+INFERENCE_PY = Path("/opt/app/inference.py")
+MODEL_WSI_DIR = Path("/tmp/faith/wsi")                                   # empty folders that only the notebook fills
+MODEL_MASK_DIR = Path("/tmp/faith/mask")
+MODEL_OUTPUT_JSON = Path("/tmp/faith/out/overall-survival-years.json")
+MODEL_ARGS = ["--wsi-dir", str(MODEL_WSI_DIR), "--mask-dir", str(MODEL_MASK_DIR),
+              "--output", str(MODEL_OUTPUT_JSON.parent), "--no-report"]
+MODEL_SCRATCH_DIR = None
+```
+
+`--no-report` only skips the PDF; the prediction and the map are the same as on Grand Challenge. The attribution map
+for `ATTENTION_OUTPUT_DIR` is the algorithm's `attribution.tif` output above. Each call loads the model (about 20 s)
+and reads the slide (about 1.5 to 2.5 minutes on one GPU).
