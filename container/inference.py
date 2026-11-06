@@ -222,8 +222,23 @@ class Reader:
         return np.asarray(bg.resize((TILE_PX, TILE_PX), Image.BILINEAR))
 
 
+def ink_fraction(tiles):
+    """Share of tissue pixels that look like marking ink: green, blue or yellow at clear saturation, or near-black.
+    Calibrated on 162 report fields (ink 0.71 to 1.00; tissue, dark TCGA carcinoma included, at most 0.004)."""
+    a = np.stack(tiles)[:, ::4, ::4].astype(np.float32) / 255; r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    mx, mn = a.max(-1), a.min(-1); d = mx - mn + 1e-6
+    h = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60
+    sat = (mx - mn) / (mx + 1e-6); tissue = (mx < 0.92) | (sat > 0.12); n = np.maximum(tissue.sum((1, 2)), 1)
+    col = (((h >= 70) & (h <= 200) & (sat > 0.20)) | ((h > 200) & (h <= 235) & (sat > 0.30)) | ((h >= 35) & (h <= 65) & (sat > 0.30))) & tissue
+    blk = (mx < 0.18) & tissue
+    return np.maximum(col.sum((1, 2)) / n, blk.sum((1, 2)) / n / 2)      # >= 0.25: colour >= 25% or black >= 50%
+
+
+INK_THR = 0.25
+
+
 @torch.inference_mode()
-def embed(M, wsi, coords, size, bs=64, fn=None):
+def embed(M, wsi, coords, size, bs=64, fn=None, stats=None):
     rd = Reader(wsi, threads=min(16, os.cpu_count() or 4)); q = queue.Queue(maxsize=4)
 
     err = []
@@ -241,6 +256,8 @@ def embed(M, wsi, coords, size, bs=64, fn=None):
     while (b := q.get()) is not None:
         good = [t is not None for t in b]; ok += good
         if any(good):
+            if stats is not None:                             # report-only colour check, aligned with the tiles kept
+                stats.extend(ink_fraction([t for t in b if t is not None]).tolist())
             x = torch.from_numpy(np.stack([t for t in b if t is not None])).to(M["dev"]).permute(0, 3, 1, 2).float().div_(255)
             out.append((fn or f_midnight)(M, x))
     rd.pool.shutdown()
@@ -542,7 +559,7 @@ def excl_change(A, V, w, S):
     return float((w * (y2 - y)).sum())
 
 
-def report_data(M, Xm, A, V, w, c_single, order, kxy, s20, mpp0, per):
+def report_data(M, Xm, A, V, w, c_single, order, kxy, s20, mpp0, per, ink=None):
     sd = M["cal"]["z_sd"]; n = len(kxy); comp, nuc = concept_readouts(M, Xm); d = dict(n=n, sd=sd, comp=comp)
     up = [int(i) for i in order[:6]]; dn = [int(i) for i in np.argsort(c_single, kind="stable") if c_single[i] < 0][:3]
     pct = None if nuc is None else {k: (np.argsort(np.argsort(nuc[:, k], kind="stable"), kind="stable") + 0.5) / n * 100 for k, _ in NUC_SHOW}
@@ -555,10 +572,14 @@ def report_data(M, Xm, A, V, w, c_single, order, kxy, s20, mpp0, per):
         return f"{COMP_LABEL[comp[i]].lower()}; " + "; ".join(parts)
     field = lambda i: dict(i=i, mm=(kxy[i] + s20 / 2) * mpp0 / 1000, chg=-float(c_single[i]) / sd, desc=describe(i),
                            comp=None if comp is None else int(comp[i]),
-                           nuc=None if pct is None else {name: float(pct[k][i]) for k, name in NUC_SHOW})
+                           nuc=None if pct is None else {name: float(pct[k][i]) for k, name in NUC_SHOW},
+                           ink=bool(ink is not None and ink[i] >= INK_THR))
     d["up"], d["dn"] = [field(i) for i in up], [field(i) for i in dn]
     sel_ = lambda ids: np.isin(np.arange(n), ids)
     d["up6"] = excl_change(A, V, w, sel_(up)) / sd              # the listed fields removed together
+    if ink is not None:                                         # fields that look like marking ink, and the result without them
+        fl = np.asarray(ink) >= INK_THR
+        d["ink"] = dict(n=int(fl.sum()), share=float(fl.mean()), chg=(excl_change(A, V, w, fl) / sd) if 0 < fl.sum() < n else None)
     d["top"] = [(fr, int(max(1, round(fr * n))), excl_change(A, V, w, sel_(order[:max(1, round(fr * n))])) / sd) for fr in (0.01, 0.05, 0.10)]
     d["enc"] = {e: pct_of(per[e], REF["enc_q"][e]) for e in per}
     if comp is not None:                                  # slide-level morphology measures, as in the development reference (E55)
@@ -719,10 +740,16 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
         pts = lambda v: "less than 1 percentile point" if v < 1 else f"{v:.0f} percentile point{'s' if round(v) != 1 else ''}"
         interp.append(f"Within the gland epithelium, the ranking leans on fields with {'dense' if mh > ml else 'sparse'} nuclei: removing the "
                       f"densest quarter moves it by {pts(mh)}, removing the least dense quarter by {pts(ml)}.")
-    n_ep = sum(1 for fd in d["up"][:6] if fd.get("comp") == 0)
+    n_ep = sum(1 for fd in d["up"][:6] if fd.get("comp") == 0); n_up = min(6, len(d["up"]))
     if d["up"]:
-        interp.append(f"{n_ep} of the {min(6, len(d['up']))} evidence regions on page 2 are epithelium-enriched glands by automated estimate; "
-                      "their identity as carcinoma needs the pathologist's confirmation.")
+        interp.append(f"{'All ' + str(n_up) if n_ep == n_up else f'{n_ep} of the {n_up}'} evidence regions on page 2 "
+                      f"{'is an epithelium-enriched gland' if n_ep == 1 and n_up > 1 else 'are epithelium-enriched glands'} by automated "
+                      "estimate; their identity as carcinoma needs the pathologist's confirmation.")
+    ink = d.get("ink") or {}
+    if ink.get("n"):
+        interp.append(f"{ink['n']:,} of the fields read {'looks' if ink['n'] == 1 else 'look'} like marking ink (automated colour check)"
+                      + (f"; without them the result would be the {po(after(ink['chg']))} percentile ({band_of(after(ink['chg']))} band)."
+                         if ink.get("chg") is not None else "."))
     interp.append(f"In the Radboudumc development cohort, {bcr5[band]:.0f}% of patients in the {band} band had biochemical recurrence within "
                   f"5 years (low {bcr5['low']:.0f}%, medium {bcr5['medium']:.0f}%, high {bcr5['high']:.0f}%).")
 
@@ -757,7 +784,7 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
         text(f, 0.325, 0.750, f"Higher than about {Pn}% of 806 development patients. A ranking, not a probability of recurrence for this "
              "patient. Gleason grade, stage, margins and PSA were not used.", size=6.7, w=0.6, color=MUTED, lh=1.25)
         # morphology findings table
-        nrow = len(FIND); th = 0.032 + 0.040 + nrow * 0.0235 + 0.012
+        RH = 0.0215; nrow = len(FIND); th = 0.032 + 0.038 + nrow * RH + 0.010
         y = section(f, 0.06, 0.705, 0.88, th, "Morphology findings")
         cols = [0.075, 0.34, 0.47, 0.70]
         for x_, h_ in zip(cols, ("Finding", "This slide", "Development reference", "Effect on the result")):
@@ -773,25 +800,25 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
                 f.text(cols[2] + 0.148, y, po(pr), size=6.8, color=INK, va="top")
             if eff:
                 text(f, cols[3], y + 0.001, eff, size=6.6, w=0.23, color=INK, lh=1.2)
-            y -= 0.0235
+            y -= RH
         text(f, 0.075, y + 0.004, "Effect: where the result would move if that tissue were removed from the analysis (exact recomputation). "
              "Findings are automated estimates from the image; reference = the same measures on 806 development slides.", size=6.0, w=0.85, color=MUTED, lh=1.2)
-        y_int = 0.705 - th - 0.010
+        y_int = 0.705 - th - 0.007
         # interpretation
-        ih = 0.032 + 0.0145 * sum(len(wrap(s, 0.82, 7.8).split("\n")) for s in interp) + 0.006 * len(interp) + 0.006
+        ih = 0.030 + 0.0127 * sum(len(wrap(s, 0.82, 7.8).split("\n")) for s in interp) + 0.0045 * len(interp) + 0.005
         y = section(f, 0.06, y_int, 0.88, ih, "Interpretation")
         for s in interp:
             f.text(0.078, y, "•", size=8.5, va="top", color=INK); y = text(f, 0.093, y, s, size=7.8, w=0.82) - 0.003
-        y_act = y_int - ih - 0.010
+        y_act = y_int - ih - 0.007
         # pathologist verification
-        y = section(f, 0.06, y_act, 0.88, 0.096, "Pathologist verification before use", accent=RED)
+        y = section(f, 0.06, y_act, 0.88, 0.088, "Pathologist verification before use", accent=RED)
         y = text(f, 0.075, y, "The result depends most on the six regions shown on page 2. Confirm that they are carcinoma and free of artefact. "
                  "If most are not carcinoma, or are artefact, treat the result as unreliable and do not report it.", size=7.7, w=0.85) - 0.006
         xx = 0.08
         for lab in ("Regions reviewed", "Mostly carcinoma", "No major artefact", "Result reportable"):
             xx = checkbox(f, xx, y - 0.004, lab, 7.4)
         f.text(0.08, y - 0.022, "Pathologist: ______________________     Date: ____________", size=7.2, color=INK, va="center")
-        y_q = y_act - 0.096 - 0.010
+        y_q = y_act - 0.088 - 0.007
         # quality metrics
         qrows = [("Tissue read by the model", f"{d['n']:,} fields of 112 µm ({d['n'] * 0.012544:.0f} mm²)", tissue_ok, OK_C if tissue_ok == "Adequate" else WARN_C),
                  ("Gland-epithelium fields", f"{n_epi:,}", epi_ok, OK_C if epi_ok == "Adequate" else WARN_C),
@@ -799,11 +826,15 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
                   OK_C if n_agree == 3 else WARN_C),
                  ("Distance from the nearest band cut-off", f"{round(dist)} points from the {ordinal(near)} percentile", "Clear" if dist >= 5 else "Borderline",
                   OK_C if dist >= 5 else WARN_C)]
-        qh = 0.032 + 0.0175 * len(qrows) + 0.004
+        if "ink" in d:
+            ik = d["ink"]; qrows.append(("Marking ink among the fields read", "none detected" if not ik["n"] else
+                                         f"{ik['n']:,} fields ({100 * ik['share']:.1f}%)" + (f"; without them: {po(after(ik['chg']))}" if ik.get("chg") is not None else ""),
+                                         "None" if not ik["n"] else "Present", OK_C if not ik["n"] else WARN_C))
+        qh = 0.030 + 0.0165 * len(qrows) + 0.003
         y = section(f, 0.06, y_q, 0.88, qh, "Quality metrics")
         for lab, val, st, col in qrows:
             f.text(0.075, y, lab, size=7.3, color=INK, va="top"); f.text(0.42, y, val, size=7.2, color=INK, va="top"); chip(f, 0.80, y - 0.0055, st, col)
-            y -= 0.0175
+            y -= 0.0165
         # evidence overview (fills the rest of page 1)
         y_e = y_q - qh - 0.010
         if y_e - 0.05 > 0.12:
@@ -852,7 +883,9 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
             nuc_w = [f"{NICE.get(nm, nm)} {WORD(v).replace(' for this slide', '')}" for nm, v in
                      sorted((fd.get("nuc") or {}).items(), key=lambda t: -abs(t[1] - 50)) if abs(v - 50) >= 25][:3]
             est = f"Automated estimate: {lab.lower()}" + (f"; {', '.join(nuc_w)} for this slide" if nuc_w else "") + "."
-            ty = text(f, x0 + 0.010, iy - 0.004, est, size=6.5, w=0.41, color=MUTED, lh=1.2)
+            if fd.get("ink"):
+                est = "Possible marking ink. " + est
+            ty = text(f, x0 + 0.010, iy - 0.004, est, size=6.5, w=0.41, color=RED if fd.get("ink") else MUTED, lh=1.2)
             cy = ty - 0.008; xx = x0 + 0.010
             f.text(xx, cy, "Review:", size=6.6, color=INK, va="center", weight="bold"); xx += 0.060
             for lab_ in ("Carcinoma", "Benign", "Stroma/other", "Artefact"):
@@ -907,7 +940,8 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
             a = f.add_axes([x0, y - sh, sq, sh]); a.imshow(fld); a.axis("off")
             f.text(x0, y - sh - 0.008, f"{'abc'[k]}   x {fd['mm'][0]:.1f}, y {fd['mm'][1]:.1f} mm", size=7, weight="bold", color=BLUE, va="top")
             lab = COMP_LABEL[fd["comp"]].lower() if fd.get("comp") is not None else ""
-            f.text(x0, y - sh - 0.021, f"Automated estimate: {lab}", size=6.5, color=MUTED, va="top")
+            f.text(x0, y - sh - 0.021, "Possible marking ink" if fd.get("ink") else f"Automated estimate: {lab}", size=6.5,
+                   color=RED if fd.get("ink") else MUTED, va="top")
         pdf.savefig(f); plt.close(f)
 
         # ============================================================ page 4: outcomes by band
@@ -1049,7 +1083,8 @@ def handle(M):
     log(f"slide {W}x{H} mpp {mpp0:.4f}; mask {mask.shape} ({mspacing:.2f} um/px); tiles {len(all_xy)} -> {len(xy)}")
     if len(xy) == 0:                                    # empty mask (e.g. every field removed): nothing to read
         return write_empty(M, mask, mspacing, sl, t0)
-    X, ok = embed(M, wsi, xy, s20)
+    ink_all = []
+    X, ok = embed(M, wsi, xy, s20, stats=ink_all)
     if X is None:
         return write_empty(M, mask, mspacing, sl, t0, note="No field could be read from the slide image, so the development median is reported.")
     xy = xy[ok]
@@ -1065,6 +1100,7 @@ def handle(M):
     if F2 is None:
         return write_empty(M, mask, mspacing, sl, t0, note="No analysed field could be read again, so the development median is reported.")
     sel = sel[ok2]
+    ink_sel = np.asarray(ink_all, float)[sel] if len(ink_all) == len(xy) else np.zeros(len(sel))
     F = dict(midnight=X[sel].half().float(), **F2)
     log(f"UNI2-h + Phikon-v2 embedded {len(sel)} tiles")
     z, c_single, per, (A_, V_, w_) = score_v2(M, F)
@@ -1104,7 +1140,7 @@ def handle(M):
     try:
         info = dict(group=group, z=z, pct=pct, mpp0=mpp0, mm2=tissue.sum() * (s20 * mpp0 / 1000) ** 2, case=f"Case {Path(wsi).stem}",
                     n_grid=int(len(xy)), filt=100.0 * (1 - tissue.mean()))
-        d = report_data(M, F["midnight"].float().cpu().numpy(), A_, V_, w_, c_single, order, kxy, s20, mpp0, per)
+        d = report_data(M, F["midnight"].float().cpu().numpy(), A_, V_, w_, c_single, order, kxy, s20, mpp0, per, ink=ink_sel)
         rd = Reader(wsi, 4)
 
         def ctx(xy_l0):

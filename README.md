@@ -140,6 +140,10 @@ Inputs are read defensively: masks as TIFF (any tiling, bit depth or photometric
 the mask uses 1 and any non-zero value otherwise; the slide's pixel size from its resolution tag, openslide or the
 mask's spacing, accepted only between 0.08 and 2 um; a slide region that cannot be read is skipped.
 
+The report flags fields that look like marking ink (an automated colour check on each field read: green, blue or yellow
+on at least 25% of the tissue pixels, or near-black on at least 50%), counts them in the quality metrics and states
+where the result would move without them. The check is report-only: the prediction and the map do not change.
+
 ## Citation
 
 Paper under review (WACV 2027 CVPath workshop).
