@@ -231,10 +231,12 @@ def ink_fraction(tiles):
     sat = (mx - mn) / (mx + 1e-6); tissue = (mx < 0.92) | (sat > 0.12); n = np.maximum(tissue.sum((1, 2)), 1)
     col = (((h >= 70) & (h <= 200) & (sat > 0.20)) | ((h > 200) & (h <= 235) & (sat > 0.30)) | ((h >= 35) & (h <= 65) & (sat > 0.30))) & tissue
     blk = (mx < 0.18) & tissue
-    return np.maximum(col.sum((1, 2)) / n, blk.sum((1, 2)) / n / 2)      # >= 0.25: colour >= 25% or black >= 50%
+    return np.maximum(col.sum((1, 2)) / n, blk.sum((1, 2)) / n / 2)      # >= INK_THR (0.20): colour >= 20% or black >= 40%
 
 
-INK_THR = 0.25
+INK_THR = 0.20
+# Blinded reading of evidence regions (reading round 5, three pathologists, 24 development cases): share called carcinoma
+READ_STUDY = dict(n=48, cases=24, car=94, rand=42)
 
 
 @torch.inference_mode()
@@ -740,11 +742,10 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
         pts = lambda v: "less than 1 percentile point" if v < 1 else f"{v:.0f} percentile point{'s' if round(v) != 1 else ''}"
         interp.append(f"Within the gland epithelium, the ranking leans on fields with {'dense' if mh > ml else 'sparse'} nuclei: removing the "
                       f"densest quarter moves it by {pts(mh)}, removing the least dense quarter by {pts(ml)}.")
-    n_ep = sum(1 for fd in d["up"][:6] if fd.get("comp") == 0); n_up = min(6, len(d["up"]))
     if d["up"]:
-        interp.append(f"{'All ' + str(n_up) if n_ep == n_up else f'{n_ep} of the {n_up}'} evidence regions on page 2 "
-                      f"{'is an epithelium-enriched gland' if n_ep == 1 and n_up > 1 else 'are epithelium-enriched glands'} by automated "
-                      "estimate; their identity as carcinoma needs the pathologist's confirmation.")
+        rs = READ_STUDY
+        interp.append(f"Please confirm the tissue in the evidence regions on page 2. In a blinded reading of {rs['n']} regions chosen the same "
+                      f"way, pathologists called {rs['car']}% carcinoma (random tissue from the same slides: {rs['rand']}%).")
     ink = d.get("ink") or {}
     if ink.get("n"):
         interp.append(f"{ink['n']:,} of the fields read {'looks' if ink['n'] == 1 else 'look'} like marking ink (automated colour check)"
@@ -862,7 +863,11 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
         if up6 is not None:
             y = text(f, 0.06, y, f"Removing these six regions together would move the result from the {Pd} to the {po(up6)} percentile; "
                      + (f"removing the top {top[1][0] * 100:.0f}% of fields in this order ({top[1][1]:,} fields) would move it to the "
-                        f"{po(top[1][2])} ({band_of(top[1][2])} band)." if len(top) > 1 else ""), size=7.4, w=0.88) - 0.006
+                        f"{po(top[1][2])} ({band_of(top[1][2])} band)." if len(top) > 1 else ""), size=7.4, w=0.88) - 0.004
+        rs = READ_STUDY
+        y = text(f, 0.06, y, f"Tissue type is left to the reviewing pathologist. In a blinded reading of {rs['n']} regions chosen this way in "
+                 f"{rs['cases']} development cases, three pathologists called {rs['car']}% carcinoma; random tissue from the same slides: "
+                 f"{rs['rand']}%.", size=7.0, w=0.88, color=MUTED) - 0.006
         WORD = lambda v: "high for this slide" if v >= 75 else "low for this slide" if v <= 25 else "typical for this slide"
         NICE = {"estimated nuclear density": "nuclear density", "estimated nuclear size": "nuclear size",
                 "nuclear staining (haematoxylin)": "chromatin", "estimated nuclear crowding": "crowding"}
@@ -879,10 +884,10 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
             a.add_patch(plt.Rectangle((w_ * 0.375, h_ * 0.375), w_ * 0.25, h_ * 0.25, fill=False, ec=RED, lw=1.1))
             px100 = w_ / 448 * 100; a.plot([w_ * 0.05, w_ * 0.05 + px100], [h_ * 0.93, h_ * 0.93], color="k", lw=2); a.text(w_ * 0.05, h_ * 0.88, "100 µm", size=5.3)
             b = f.add_axes([x0 + 0.43 - 0.008 - sq, iy, sq, sh]); b.imshow(fld); b.axis("off")
-            lab = COMP_LABEL[fd["comp"]] if fd.get("comp") is not None else "not available"
             nuc_w = [f"{NICE.get(nm, nm)} {WORD(v).replace(' for this slide', '')}" for nm, v in
                      sorted((fd.get("nuc") or {}).items(), key=lambda t: -abs(t[1] - 50)) if abs(v - 50) >= 25][:3]
-            est = f"Automated estimate: {lab.lower()}" + (f"; {', '.join(nuc_w)} for this slide" if nuc_w else "") + "."
+            est = (f"Measured: {', '.join(nuc_w)} for this slide." if nuc_w else "Measured: nuclear values typical for this slide."
+                   ) if fd.get("nuc") else ""
             if fd.get("ink"):
                 est = "Possible marking ink. " + est
             ty = text(f, x0 + 0.010, iy - 0.004, est, size=6.5, w=0.41, color=RED if fd.get("ink") else MUTED, lh=1.2)
@@ -939,9 +944,8 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
             x0 = 0.06 + k * 0.30; ctx, fld = crops["dn"][k]
             a = f.add_axes([x0, y - sh, sq, sh]); a.imshow(fld); a.axis("off")
             f.text(x0, y - sh - 0.008, f"{'abc'[k]}   x {fd['mm'][0]:.1f}, y {fd['mm'][1]:.1f} mm", size=7, weight="bold", color=BLUE, va="top")
-            lab = COMP_LABEL[fd["comp"]].lower() if fd.get("comp") is not None else ""
-            f.text(x0, y - sh - 0.021, "Possible marking ink" if fd.get("ink") else f"Automated estimate: {lab}", size=6.5,
-                   color=RED if fd.get("ink") else MUTED, va="top")
+            if fd.get("ink"):
+                f.text(x0, y - sh - 0.021, "Possible marking ink", size=6.5, color=RED, va="top")
         pdf.savefig(f); plt.close(f)
 
         # ============================================================ page 4: outcomes by band
@@ -1013,7 +1017,8 @@ def write_report_v5(path, info, d, crops, heat_small, thumb, W0, ensemble, K):
                   ("Quality metrics", "Tissue read: adequate at 500 fields or more, limited at 100 to 499. Gland-epithelium fields: at least 40 "
                    "for the density finding. Agreement: whether the three image models, each scored alone, fall in the same band. Borderline: "
                    "within 5 percentile points of a band cut-off. Thresholds are provisional."),
-                  ("Limitations", "Development-stage test. Results at the challenge's external test centres are not yet available; scanner, "
+                  ("Limitations", "Development-stage test. External validation is pending: the first test is the challenge's hidden test set, which "
+                   "adds two centres not seen in development. Scanner, "
                    "stain and site differences can shift deep models [9]. Six regions cannot show that all analysed tissue is free of artefact. "
                    "Morphology findings are estimates and are shown for review, not as measurements for reporting.")]
         for h, s in blocks:

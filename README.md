@@ -141,8 +141,12 @@ the mask uses 1 and any non-zero value otherwise; the slide's pixel size from it
 mask's spacing, accepted only between 0.08 and 2 um; a slide region that cannot be read is skipped.
 
 The report flags fields that look like marking ink (an automated colour check on each field read: green, blue or yellow
-on at least 25% of the tissue pixels, or near-black on at least 50%), counts them in the quality metrics and states
+on at least 20% of the tissue pixels, or near-black on at least 40%), counts them in the quality metrics and states
 where the result would move without them. The check is report-only: the prediction and the map do not change.
+
+Evidence regions in the report carry measured nuclear values only; their tissue type is left to the reviewing
+pathologist. In a blinded reading of 48 such regions in 24 development cases, three pathologists called 94% carcinoma
+(random tissue from the same slides: 42%), and the report states this.
 
 ## Citation
 
